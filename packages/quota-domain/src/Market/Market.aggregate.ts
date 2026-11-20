@@ -2,12 +2,7 @@ import * as Domain from "@alchemy.run/domain";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import {
-  CampaignNotFound,
-  InvoiceNotReady,
-  NoEligibleCampaign,
-  UnknownReservation,
-} from "../Rejections.ts";
+import { CampaignNotFound, InvoiceNotReady, NoEligibleCampaign } from "../Rejections.ts";
 import {
   applyExposureToCounters,
   CampaignRecord,
@@ -16,6 +11,7 @@ import {
   InvoiceSnapshot,
   MarketId,
   pickWeightedCampaign,
+  Placement,
   ReservationId,
   ReservationRecord,
 } from "../Types.ts";
@@ -32,39 +28,33 @@ import {
   UpsertCampaign,
 } from "./Market.commands.ts";
 
+/**
+ * Steelmanned `MarketState` — aggressively pruned to stay small:
+ * - Only currently *active* (unexpired, unqualified) holds live in `activeReservations`.
+ *   Qualified and expired reservations are deleted immediately on evolve.
+ * - Opportunity & exposure retry deduplication is delegated to `@alchemy.run/domain`'s
+ *   built-in `commandId` receipt (`receipt:<commandId>`), NOT duplicated in state.
+ * - Client receipts carry signed `(campaignId, placement)` so late exposures still
+ *   account honestly after `LeaseExpired` prunes the active hold.
+ *
+ * Even with `"meta"` kept small (~1–5 KiB), the real bottlenecks remain:
+ * 1. Single-DO serialization (`blockConcurrencyWhile`) caps burst throughput / tail latency.
+ * 2. Framework-managed `event:*`, `receipt:*`, Policy `seen:*`, and per-lease
+ *    `armed:*`/`scheduled:*`/`cb:*` keys still grow unboundedly with zero compaction.
+ */
 export const MarketState = Schema.Struct({
   campaigns: Schema.Record(Schema.String, CampaignRecord),
-  reservations: Schema.Record(Schema.String, ReservationRecord),
-  opportunityDecisions: Schema.Record(Schema.String, Schema.Array(ReservationId)),
-  seenExposures: Schema.Record(Schema.String, Schema.Boolean),
+  activeReservations: Schema.Record(Schema.String, ReservationRecord),
   invoices: Schema.Record(Schema.String, InvoiceSnapshot),
 });
 export type MarketState = typeof MarketState.Type;
 
 export const initialMarketState: MarketState = {
   campaigns: {},
-  reservations: {},
-  opportunityDecisions: {},
-  seenExposures: {},
+  activeReservations: {},
   invoices: {},
 };
 
-/**
- * Topology A — Single Market Aggregate.
- *
- * Semantically ideal: atomic weighted selection across all eligible campaigns,
- * atomic paired [primary, companion] reservation, idempotent late-safe exposure
- * accounting, and immutable invoice snapshots.
- *
- * Runtime friction under @alchemy.run/domain/Cloudflare:
- * 1. Every decision, exposure report, and lease expiry across the whole market
- *    serializes through ONE DO (`blockConcurrencyWhile`).
- * 2. `reservations`, `opportunityDecisions`, and `seenExposures` live inside
- *    `"meta"`, so every command rewrites an ever-growing JSON blob AND appends
- *    unbounded `event:*` + `receipt:*` keys.
- * 3. Expiring leases via `schedule` creates one durable callback job per
- *    reservation instead of a single indexed expiry sweep.
- */
 export class Market extends Domain.Aggregate("Market", {
   id: MarketId,
   state: MarketState,
@@ -77,11 +67,10 @@ export class Market extends Domain.Aggregate("Market", {
     },
     AllocateOpportunity: (state, cmd, ctx) => {
       const now = DateTime.toEpochMillis(ctx.now);
-      // Idempotent by opportunityId across retries.
-      const existing = state.opportunityDecisions[cmd.opportunityId];
-      if (existing && existing.length > 0) return [];
-
-      const eligible: Array<{ campaign: CampaignRecord; placements: ReadonlyArray<"primary" | "companion" | "secondary"> }> = [];
+      const eligible: Array<{
+        campaign: CampaignRecord;
+        placements: ReadonlyArray<Placement>;
+      }> = [];
       for (const campaign of Object.values(state.campaigns)) {
         const placements = canServePaired(campaign, cmd.audience, now);
         if (placements.length > 0) eligible.push({ campaign, placements });
@@ -107,28 +96,27 @@ export class Market extends Domain.Aggregate("Market", {
       ];
     },
     RecordExposure: (state, cmd) => {
-      if (state.seenExposures[cmd.exposureId]) return [];
-      const res = state.reservations[cmd.reservationId];
-      if (!res) return new UnknownReservation({ reservationId: cmd.reservationId });
-      if (res.status === "qualified") return [];
+      const campaign = state.campaigns[cmd.campaignId];
+      if (!campaign) return new CampaignNotFound({ campaignId: cmd.campaignId });
+      const active = state.activeReservations[cmd.reservationId];
       return [
         new ExposureAccounted({
           exposureId: cmd.exposureId,
-          reservationId: res.id,
-          campaignId: res.campaignId,
-          placement: res.placement,
-          late: res.status === "expired" || res.status === "released",
+          reservationId: cmd.reservationId,
+          campaignId: cmd.campaignId,
+          placement: cmd.placement,
+          late: active === undefined,
         }),
       ];
     },
     ExpireLease: (state, cmd) => {
-      const res = state.reservations[cmd.reservationId];
-      if (!res || res.status !== "active") return [];
+      const active = state.activeReservations[cmd.reservationId];
+      if (!active) return [];
       return [
         new LeaseExpired({
-          reservationId: res.id,
-          campaignId: res.campaignId,
-          placement: res.placement,
+          reservationId: active.id,
+          campaignId: active.campaignId,
+          placement: active.placement,
         }),
       ];
     },
@@ -136,7 +124,10 @@ export class Market extends Domain.Aggregate("Market", {
       if (state.invoices[cmd.campaignId]) return [];
       const campaign = state.campaigns[cmd.campaignId];
       if (!campaign) return new CampaignNotFound({ campaignId: cmd.campaignId });
-      const remPrimary = Math.max(0, campaign.counters.primary.target - campaign.counters.primary.credited);
+      const remPrimary = Math.max(
+        0,
+        campaign.counters.primary.target - campaign.counters.primary.credited,
+      );
       const remCompanion = Math.max(
         0,
         campaign.counters.companion.target - campaign.counters.companion.credited,
@@ -194,15 +185,13 @@ export class Market extends Domain.Aggregate("Market", {
       const campaign = state.campaigns[e.campaignId];
       if (!campaign) return state;
       const nextCounters = { ...campaign.counters };
-      const nextReservations = { ...state.reservations };
-      const resIds: Array<ReservationId> = [];
+      const nextActive = { ...state.activeReservations };
       for (const item of e.reservations) {
-        resIds.push(item.reservationId);
         nextCounters[item.placement] = {
           ...nextCounters[item.placement],
           reserved: nextCounters[item.placement].reserved + 1,
         };
-        nextReservations[item.reservationId] = {
+        nextActive[item.reservationId] = {
           id: item.reservationId,
           opportunityId: e.opportunityId,
           campaignId: e.campaignId,
@@ -218,25 +207,18 @@ export class Market extends Domain.Aggregate("Market", {
           ...state.campaigns,
           [e.campaignId]: { ...campaign, counters: nextCounters },
         },
-        reservations: nextReservations,
-        opportunityDecisions: {
-          ...state.opportunityDecisions,
-          [e.opportunityId]: resIds,
-        },
+        activeReservations: nextActive,
       };
     },
     ExposureAccounted: (state, e) => {
-      const res = state.reservations[e.reservationId];
       const campaign = state.campaigns[e.campaignId];
-      if (!res || !campaign) return state;
-      const wasActive = res.status === "active";
+      if (!campaign) return state;
+      const wasActive = e.reservationId in state.activeReservations;
+      const nextActive = { ...state.activeReservations };
+      delete nextActive[e.reservationId];
       return {
         ...state,
-        seenExposures: { ...state.seenExposures, [e.exposureId]: true },
-        reservations: {
-          ...state.reservations,
-          [e.reservationId]: { ...res, status: "qualified" as const },
-        },
+        activeReservations: nextActive,
         campaigns: {
           ...state.campaigns,
           [e.campaignId]: {
@@ -250,16 +232,15 @@ export class Market extends Domain.Aggregate("Market", {
       };
     },
     LeaseExpired: (state, e) => {
-      const res = state.reservations[e.reservationId];
+      const active = state.activeReservations[e.reservationId];
       const campaign = state.campaigns[e.campaignId];
-      if (!res || !campaign || res.status !== "active") return state;
+      if (!active || !campaign) return state;
+      const nextActive = { ...state.activeReservations };
+      delete nextActive[e.reservationId];
       const c = campaign.counters[e.placement];
       return {
         ...state,
-        reservations: {
-          ...state.reservations,
-          [e.reservationId]: { ...res, status: "expired" as const },
-        },
+        activeReservations: nextActive,
         campaigns: {
           ...state.campaigns,
           [e.campaignId]: {
@@ -288,10 +269,7 @@ export class Market extends Domain.Aggregate("Market", {
     },
     RecordExposure: (_state, events) => {
       const accounted = events.find((e) => e._tag === "ExposureAccounted");
-      return {
-        duplicate: accounted === undefined,
-        late: accounted ? accounted.late : false,
-      };
+      return { late: accounted ? accounted.late : false };
     },
     FinalizeInvoice: (state, events) => {
       const finalized = events.find((e) => e._tag === "InvoiceFinalized");
@@ -302,12 +280,8 @@ export class Market extends Domain.Aggregate("Market", {
 }) {}
 
 /**
- * Idiomatic @alchemy.run/domain deadline policy: schedules one `ExpireLease`
+ * Idiomatic `@alchemy.run/domain` deadline policy: schedules one `ExpireLease`
  * command per issued reservation.
- *
- * Clean in stories, but at 200-400 opportunities/s × 2-3 placements, this
- * stages 400-1,200 outbox rows/s, invokes a Policy DO 400-1,200 times/s,
- * and arms 400-1,200 individual durable callback timers/s back on `Market`.
  */
 export class ScheduleLeaseExpiry extends Domain.Policy("ScheduleLeaseExpiry", {
   from: Market,

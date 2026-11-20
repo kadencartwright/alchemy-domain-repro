@@ -2,7 +2,7 @@ import * as Domain from "@alchemy.run/domain";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { NoEligibleCampaign, UnknownReservation } from "../Rejections.ts";
+import { NoEligibleCampaign } from "../Rejections.ts";
 import {
   applyExposureToCounters,
   Audience,
@@ -199,20 +199,21 @@ export class RecordCellExposure extends Domain.Command("RecordCellExposure", {
   input: {
     exposureId: ExposureId,
     reservationId: ReservationId,
+    campaignId: CampaignId,
+    placement: Placement,
   },
   events: [CellExposureAccounted],
-  rejects: [UnknownReservation],
-  reply: { duplicate: Schema.Boolean },
+  rejects: [],
+  reply: { late: Schema.Boolean },
 }) {}
 
 const CellState = Schema.Struct({
   campaigns: Schema.Record(Schema.String, CampaignRecord),
-  reservations: Schema.Record(Schema.String, ReservationRecord),
-  seenExposures: Schema.Record(Schema.String, Schema.Boolean),
+  activeReservations: Schema.Record(Schema.String, ReservationRecord),
 });
 
 /**
- * Topology C (part 2) — Sharded AllocationCell Aggregate.
+ * Topology C (part 2) — Sharded AllocationCell Aggregate (pruned active-hold state).
  *
  * Horizontally shards write throughput across N DOs in 1 hop per decision,
  * but exposes classic escrow tradeoffs:
@@ -223,7 +224,7 @@ const CellState = Schema.Struct({
 export class AllocationCell extends Domain.Aggregate("AllocationCell", {
   id: CellId,
   state: CellState,
-  initial: { campaigns: {}, reservations: {}, seenExposures: {} },
+  initial: { campaigns: {}, activeReservations: {} },
   commands: [InstallCellGrant, AllocateInCell, RecordCellExposure],
   decide: {
     InstallCellGrant: (_state, cmd) => {
@@ -261,16 +262,13 @@ export class AllocationCell extends Domain.Aggregate("AllocationCell", {
       ];
     },
     RecordCellExposure: (state, cmd) => {
-      if (state.seenExposures[cmd.exposureId]) return [];
-      const res = state.reservations[cmd.reservationId];
-      if (!res) return new UnknownReservation({ reservationId: cmd.reservationId });
-      if (res.status === "qualified") return [];
+      if (!state.campaigns[cmd.campaignId]) return [];
       return [
         new CellExposureAccounted({
           exposureId: cmd.exposureId,
-          reservationId: res.id,
-          campaignId: res.campaignId,
-          placement: res.placement,
+          reservationId: cmd.reservationId,
+          campaignId: cmd.campaignId,
+          placement: cmd.placement,
         }),
       ];
     },
@@ -305,13 +303,13 @@ export class AllocationCell extends Domain.Aggregate("AllocationCell", {
       const campaign = state.campaigns[e.campaignId];
       if (!campaign) return state;
       const nextCounters = { ...campaign.counters };
-      const nextRes = { ...state.reservations };
+      const nextActive = { ...state.activeReservations };
       for (const r of e.reservations) {
         nextCounters[r.placement] = {
           ...nextCounters[r.placement],
           reserved: nextCounters[r.placement].reserved + 1,
         };
-        nextRes[r.reservationId] = {
+        nextActive[r.reservationId] = {
           id: r.reservationId,
           opportunityId: e.opportunityId,
           campaignId: e.campaignId,
@@ -324,21 +322,18 @@ export class AllocationCell extends Domain.Aggregate("AllocationCell", {
       return {
         ...state,
         campaigns: { ...state.campaigns, [e.campaignId]: { ...campaign, counters: nextCounters } },
-        reservations: nextRes,
+        activeReservations: nextActive,
       };
     },
     CellExposureAccounted: (state, e) => {
-      const res = state.reservations[e.reservationId];
       const campaign = state.campaigns[e.campaignId];
-      if (!res || !campaign) return state;
-      const wasActive = res.status === "active";
+      if (!campaign) return state;
+      const wasActive = e.reservationId in state.activeReservations;
+      const nextActive = { ...state.activeReservations };
+      delete nextActive[e.reservationId];
       return {
         ...state,
-        seenExposures: { ...state.seenExposures, [e.exposureId]: true },
-        reservations: {
-          ...state.reservations,
-          [e.reservationId]: { ...res, status: "qualified" as const },
-        },
+        activeReservations: nextActive,
         campaigns: {
           ...state.campaigns,
           [e.campaignId]: {
@@ -360,9 +355,10 @@ export class AllocationCell extends Domain.Aggregate("AllocationCell", {
         reservationIds: allocated ? allocated.reservations.map((r) => r.reservationId) : [],
       };
     },
-    RecordCellExposure: (_state, events) => ({
-      duplicate: !events.some((e) => e._tag === "CellExposureAccounted"),
-    }),
+    RecordCellExposure: (state, events) => {
+      const accounted = events.find((e) => e._tag === "CellExposureAccounted");
+      return { late: accounted ? !(accounted.reservationId in state.activeReservations) : false };
+    },
   },
 }) {}
 

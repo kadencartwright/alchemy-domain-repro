@@ -1,7 +1,7 @@
 import * as Domain from "@alchemy.run/domain";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
-import { InsufficientQuota, UnknownReservation } from "../Rejections.ts";
+import { InsufficientQuota } from "../Rejections.ts";
 import {
   applyExposureToCounters,
   Audience,
@@ -88,20 +88,20 @@ export class RecordCampaignExposure extends Domain.Command("RecordCampaignExposu
   input: {
     exposureId: ExposureId,
     reservationId: ReservationId,
+    placement: Placement,
   },
   events: [CampaignExposureRecorded],
-  rejects: [UnknownReservation],
-  reply: { duplicate: Schema.Boolean },
+  rejects: [],
+  reply: { late: Schema.Boolean },
 }) {}
 
 const CampaignAggregateState = Schema.Struct({
   config: Schema.NullOr(CampaignRecord),
-  reservations: Schema.Record(Schema.String, ReservationRecord),
-  seenExposures: Schema.Record(Schema.String, Schema.Boolean),
+  activeReservations: Schema.Record(Schema.String, ReservationRecord),
 });
 
 /**
- * Topology B — Per-Campaign Aggregate.
+ * Topology B — Per-Campaign Aggregate (pruned active-hold state).
  *
  * Isolates unrelated campaigns across separate DOs, but:
  * 1. Weighted selection across N active campaigns no longer has an atomic view;
@@ -113,7 +113,7 @@ const CampaignAggregateState = Schema.Struct({
 export class Campaign extends Domain.Aggregate("Campaign", {
   id: CampaignId,
   state: CampaignAggregateState,
-  initial: { config: null, reservations: {}, seenExposures: {} },
+  initial: { config: null, activeReservations: {} },
   commands: [ConfigureCampaign, ReserveCampaignSlots, RecordCampaignExposure],
   decide: {
     ConfigureCampaign: (_state, cmd) => {
@@ -143,16 +143,14 @@ export class Campaign extends Domain.Aggregate("Campaign", {
       ];
     },
     RecordCampaignExposure: (state, cmd) => {
-      if (state.seenExposures[cmd.exposureId]) return [];
-      const res = state.reservations[cmd.reservationId];
-      if (!res) return new UnknownReservation({ reservationId: cmd.reservationId });
-      if (res.status === "qualified") return [];
+      if (!state.config) return [];
+      const active = state.activeReservations[cmd.reservationId];
       return [
         new CampaignExposureRecorded({
           exposureId: cmd.exposureId,
-          reservationId: res.id,
-          placement: res.placement,
-          late: res.status === "expired",
+          reservationId: cmd.reservationId,
+          placement: cmd.placement,
+          late: active === undefined,
         }),
       ];
     },
@@ -183,13 +181,13 @@ export class Campaign extends Domain.Aggregate("Campaign", {
     CampaignSlotsReserved: (state, e) => {
       if (!state.config) return state;
       const nextCounters = { ...state.config.counters };
-      const nextRes = { ...state.reservations };
+      const nextActive = { ...state.activeReservations };
       for (const r of e.reservations) {
         nextCounters[r.placement] = {
           ...nextCounters[r.placement],
           reserved: nextCounters[r.placement].reserved + 1,
         };
-        nextRes[r.reservationId] = {
+        nextActive[r.reservationId] = {
           id: r.reservationId,
           opportunityId: e.opportunityId,
           campaignId: state.config.id,
@@ -202,20 +200,17 @@ export class Campaign extends Domain.Aggregate("Campaign", {
       return {
         ...state,
         config: { ...state.config, counters: nextCounters },
-        reservations: nextRes,
+        activeReservations: nextActive,
       };
     },
     CampaignExposureRecorded: (state, e) => {
-      const res = state.reservations[e.reservationId];
-      if (!state.config || !res) return state;
-      const wasActive = res.status === "active";
+      if (!state.config) return state;
+      const wasActive = e.reservationId in state.activeReservations;
+      const nextActive = { ...state.activeReservations };
+      delete nextActive[e.reservationId];
       return {
         ...state,
-        seenExposures: { ...state.seenExposures, [e.exposureId]: true },
-        reservations: {
-          ...state.reservations,
-          [e.reservationId]: { ...res, status: "qualified" as const },
-        },
+        activeReservations: nextActive,
         config: {
           ...state.config,
           counters: {
@@ -231,8 +226,9 @@ export class Campaign extends Domain.Aggregate("Campaign", {
       const reserved = events.find((e) => e._tag === "CampaignSlotsReserved");
       return { reservationIds: reserved ? reserved.reservations.map((r) => r.reservationId) : [] };
     },
-    RecordCampaignExposure: (_state, events) => ({
-      duplicate: !events.some((e) => e._tag === "CampaignExposureRecorded"),
-    }),
+    RecordCampaignExposure: (_state, events) => {
+      const recorded = events.find((e) => e._tag === "CampaignExposureRecorded");
+      return { late: recorded ? recorded.late : false };
+    },
   },
 }) {}

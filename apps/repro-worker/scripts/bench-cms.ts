@@ -16,7 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { createInstrumentedDoPlatform } from "./instrumented-do-platform.ts";
 
-const CLOUDFLARE_KV_VALUE_LIMIT_BYTES = 128 * 1024; // 128 KiB per KV value
+const SQLITE_DO_VALUE_LIMIT_BYTES = 2 * 1024 * 1024; // 2 MiB per value in SQLite-backed DOs
 
 const formatKB = (bytes: number) => `${(bytes / 1024).toFixed(1)} KiB`;
 
@@ -85,7 +85,7 @@ const runWorkspaceScalingProbe = (docCount: number) =>
       return {
         docCount,
         metaBytes: wsMetric.metaBytes,
-        exceeds128KiB: wsMetric.metaBytes > CLOUDFLARE_KV_VALUE_LIMIT_BYTES,
+        pctOf2MiB: +((wsMetric.metaBytes / SQLITE_DO_VALUE_LIMIT_BYTES) * 100).toFixed(1),
         msPerEdit: editMs / edits,
         putBytesPerEdit: Math.round(wsMetric.totalPutBytes / edits),
         putKeysPerEdit: +(wsMetric.putKeys / edits).toFixed(1),
@@ -213,14 +213,14 @@ const main = Effect.gen(function* () {
   const sizes = [10, 100, 350, 500, 750];
   console.log("1) Workspace-as-Aggregate single-field edit cost vs workspace size:");
   console.log(
-    "| Docs | `meta` size | >128 KiB KV? | Put bytes/edit | Put keys/edit (Agg / Proj) | ms/edit (local SQLite) | Total Agg keys |",
+    "| Docs | `meta` size | % of 2 MiB SQLite DO cap | Put bytes/edit | Put keys/edit (Agg) | ms/edit (local SQLite) | Total Agg keys |",
   );
-  console.log("|---:|---:|:---:|---:|---:|---:|---:|");
+  console.log("|---:|---:|---:|---:|---:|---:|---:|");
 
   for (const n of sizes) {
     const r = yield* runWorkspaceScalingProbe(n);
     console.log(
-      `| ${r.docCount} | ${formatKB(r.metaBytes)} | ${r.exceeds128KiB ? "YES" : "no"} | ${formatKB(r.putBytesPerEdit)} | ${r.putKeysPerEdit} / ${r.projPutKeysPerEdit} | ${r.msPerEdit.toFixed(2)} ms | ${r.totalWsKeys} |`,
+      `| ${r.docCount} | ${formatKB(r.metaBytes)} | ${r.pctOf2MiB}% | ${formatKB(r.putBytesPerEdit)} | ${r.putKeysPerEdit} | ${r.msPerEdit.toFixed(2)} ms | ${r.totalWsKeys} |`,
     );
     if (n === 750) {
       console.log("\n   Stored key prefixes in 750-doc Workspace DO (no built-in compaction):");

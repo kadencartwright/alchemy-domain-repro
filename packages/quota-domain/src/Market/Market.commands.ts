@@ -1,11 +1,6 @@
 import * as Domain from "@alchemy.run/domain";
 import * as Schema from "effect/Schema";
-import {
-  CampaignNotFound,
-  InvoiceNotReady,
-  NoEligibleCampaign,
-  UnknownReservation,
-} from "../Rejections.ts";
+import { CampaignNotFound, InvoiceNotReady, NoEligibleCampaign } from "../Rejections.ts";
 import {
   Audience,
   CampaignId,
@@ -102,15 +97,24 @@ export class AllocateOpportunity extends Domain.Command("AllocateOpportunity", {
   },
 }) {}
 
+/**
+ * Signed client receipt carries `(campaignId, placement, reservationId)` so
+ * the aggregate does NOT need to retain completed/expired reservations in state.
+ * Callers send `commandId: exposureId` so `@alchemy.run/domain`'s built-in
+ * command receipt deduplicates retries without keeping a `seenExposures` map
+ * inside aggregate `"meta"`.
+ */
 export class RecordExposure extends Domain.Command("RecordExposure", {
   target: MarketId,
   input: {
     exposureId: ExposureId,
     reservationId: ReservationId,
+    campaignId: CampaignId,
+    placement: Placement,
   },
   events: [ExposureAccounted],
-  rejects: [UnknownReservation],
-  reply: { duplicate: Schema.Boolean, late: Schema.Boolean },
+  rejects: [CampaignNotFound],
+  reply: { late: Schema.Boolean },
 }) {}
 
 /** Scheduled by LeaseExpiry policy; cannot reject so it can be scheduled. */

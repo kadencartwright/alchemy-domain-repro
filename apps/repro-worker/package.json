@@ -3,8 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "alchemy dev --stage local",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "bench:workerd": "node --experimental-strip-types scripts/bench-workerd.ts",
     "bench:cms": "node --experimental-strip-types scripts/bench-cms.ts",
     "bench:quota": "node --experimental-strip-types scripts/bench-quota.ts"
   },

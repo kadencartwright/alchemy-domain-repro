@@ -3,11 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "pnpm --filter @repro/worker dev",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
-    "bench:cms": "pnpm --filter @repro/worker bench:cms",
+    "bench:workerd": "pnpm --filter @repro/worker bench:workerd",
     "bench:quota": "pnpm --filter @repro/worker bench:quota",
-    "bench:all": "pnpm bench:cms && pnpm bench:quota"
+    "bench:cms": "pnpm --filter @repro/worker bench:cms",
+    "bench:all": "pnpm bench:workerd && pnpm bench:quota && pnpm bench:cms"
   },
   "devDependencies": {
     "@effect/platform-node": "4.1.5",

@@ -139,7 +139,12 @@ it.effect("Market handles paired quotas, lease expiry, honest late reports, and 
     ),
     Story.when(
       m,
-      new RecordExposure({ exposureId: ExposureId.make("exp-2p"), reservationId: r2Primary }),
+      new RecordExposure({
+        exposureId: ExposureId.make("exp-2p"),
+        reservationId: r2Primary,
+        campaignId: cid,
+        placement: "primary",
+      }),
     ),
     Story.then(
       m,
@@ -153,7 +158,12 @@ it.effect("Market handles paired quotas, lease expiry, honest late reports, and 
     ),
     Story.when(
       m,
-      new RecordExposure({ exposureId: ExposureId.make("exp-2c"), reservationId: r2Companion }),
+      new RecordExposure({
+        exposureId: ExposureId.make("exp-2c"),
+        reservationId: r2Companion,
+        campaignId: cid,
+        placement: "companion",
+      }),
     ),
     Story.then(
       m,
@@ -166,10 +176,17 @@ it.effect("Market handles paired quotas, lease expiry, honest late reports, and 
       }),
     ),
 
-    // Late report for expired opp-1 primary still counts honestly as delivered + excess.
+    // Late report for expired opp-1 primary still counts honestly as delivered + excess
+    // even though LeaseExpired already pruned opp-1 from activeReservations.
     Story.when(
       m,
-      new RecordExposure({ exposureId: ExposureId.make("exp-1p-late"), reservationId: r1Primary }),
+      new RecordExposure({
+        exposureId: ExposureId.make("exp-1p-late"),
+        reservationId: r1Primary,
+        campaignId: cid,
+        placement: "primary",
+      }),
+      { commandId: "exp-1p-late" },
     ),
     Story.then(
       m,
@@ -181,15 +198,24 @@ it.effect("Market handles paired quotas, lease expiry, honest late reports, and 
         late: true,
       }),
     ),
-    Story.replied({ duplicate: false, late: true }),
+    Story.replied({ late: true }),
 
-    // Duplicate retry of the late exposure is ignored idempotently.
+    // Duplicate retry with the same commandId is deduped by @alchemy.run/domain's receipt.
     Story.when(
       m,
-      new RecordExposure({ exposureId: ExposureId.make("exp-1p-late"), reservationId: r1Primary }),
+      new RecordExposure({
+        exposureId: ExposureId.make("exp-1p-late"),
+        reservationId: r1Primary,
+        campaignId: cid,
+        placement: "primary",
+      }),
+      { commandId: "exp-1p-late" },
     ),
     Story.then(m),
-    Story.replied({ duplicate: true, late: false }),
+    Story.replied({ late: true }),
+
+    // Confirm activeReservations was fully pruned (zero retained reservation history in state).
+    Story.state(m, (state) => Object.keys(state.activeReservations).length === 0),
 
     // Finalize invoice at fixed $500 bundle price; excess is recorded, never billed extra.
     Story.when(m, new FinalizeInvoice({ campaignId: cid })),
