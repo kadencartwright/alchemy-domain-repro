@@ -1,0 +1,10 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+allowBuilds:
+  workerd: true
+minimumReleaseAgeExclude:
+  - '@effect/platform-node-shared@4.1.5'
+  - '@effect/platform-node@4.1.5'
+  - '@effect/vitest@4.1.5'
+  - effect@4.1.5

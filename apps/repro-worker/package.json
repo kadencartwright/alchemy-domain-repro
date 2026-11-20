@@ -1,0 +1,26 @@
+{
+  "name": "@repro/worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "bench:cms": "node --experimental-strip-types scripts/bench-cms.ts",
+    "bench:quota": "node --experimental-strip-types scripts/bench-quota.ts"
+  },
+  "dependencies": {
+    "@alchemy.run/cloudflare": "2.0.0-beta.87",
+    "@alchemy.run/domain": "2.0.0-beta.87",
+    "@effect/platform-node": "4.1.5",
+    "@repro/cms-domain": "workspace:*",
+    "@repro/quota-domain": "workspace:*",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "4.1.5"
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.1.5",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "5.1.1"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "alchemy-domain-repro",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "bench:cms": "pnpm --filter @repro/worker bench:cms",
+    "bench:quota": "pnpm --filter @repro/worker bench:quota",
+    "bench:all": "pnpm bench:cms && pnpm bench:quota"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "4.1.5",
+    "@effect/vitest": "4.1.5",
+    "@types/node": "^24.0.0",
+    "effect": "4.1.5",
+    "typescript": "^5.9.3",
+    "vitest": "5.1.1"
+  }
+}
