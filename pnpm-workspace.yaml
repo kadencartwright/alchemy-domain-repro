@@ -8,3 +8,14 @@ minimumReleaseAgeExclude:
   - '@effect/platform-node@4.1.5'
   - '@effect/vitest@4.1.5'
   - effect@4.1.5
+overrides:
+  # alchemy packages built from alchemy main @ de0bdeda2 (adds Domain.Decision; unreleased).
+  # Build them first with scripts/bootstrap-alchemy.sh (vendor/ is not committed).
+  "alchemy": "file:./vendor/alchemy-main-de0bdeda2.tgz"
+  "@alchemy.run/acme": "file:./vendor/alchemy.run-acme-main-de0bdeda2.tgz"
+  "@alchemy.run/cloudflare": "file:./vendor/alchemy.run-cloudflare-main-de0bdeda2.tgz"
+  "@alchemy.run/cloudflare-runtime": "file:./vendor/alchemy.run-cloudflare-runtime-main-de0bdeda2.tgz"
+  "@alchemy.run/docker": "file:./vendor/alchemy.run-docker-main-de0bdeda2.tgz"
+  "@alchemy.run/domain": "file:./vendor/alchemy.run-domain-main-de0bdeda2.tgz"
+  "@alchemy.run/node-utils": "file:./vendor/alchemy.run-node-utils-main-de0bdeda2.tgz"
+  "@alchemy.run/sql": "file:./vendor/alchemy.run-sql-main-de0bdeda2.tgz"

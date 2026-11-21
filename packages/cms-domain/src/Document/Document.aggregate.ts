@@ -51,6 +51,7 @@ export class ContentDocument extends Domain.Aggregate("ContentDocument", {
     publishedRevision: null,
   },
   commands: [SaveDocumentDraft, PublishDocument],
+  keyOf: (cmd) => cmd.documentId,
   decide: {
     SaveDocumentDraft: (state, cmd, ctx) => {
       const actual = state.revision === 0 ? null : state.revision;
@@ -117,6 +118,7 @@ export class ScheduleSlot extends Domain.Aggregate("ScheduleSlot", {
   state: SlotState,
   initial: { claimedBy: null },
   commands: [ClaimScheduleSlot, ReleaseScheduleSlot],
+  keyOf: (cmd) => cmd.slotKey,
   decide: {
     ClaimScheduleSlot: (state, cmd) => {
       if (state.claimedBy !== null && state.claimedBy !== cmd.documentId) {

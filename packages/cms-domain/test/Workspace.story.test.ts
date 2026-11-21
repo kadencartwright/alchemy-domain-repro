@@ -50,6 +50,7 @@ const baseDraft = (
     kind: ConstructorParameters<typeof SaveDraft>[0]["kind"];
   },
 ) => ({
+  workspaceId: WorkspaceId.make("ws-podcast"),
   expectedRevision: null,
   slug: null,
   ownershipType: null,
@@ -90,7 +91,9 @@ it.effect(
     return workspaceStory(
       Story.clock("2026-11-20T12:00:00Z"),
       // Seed tags & segment
-      Story.when(ws, new SaveDraft(baseDraft({ documentId: tag1, title: "Tech", kind: "taxonomyTag" }))),
+      Story.when(
+        new SaveDraft(baseDraft({ documentId: tag1, title: "Tech", kind: "taxonomyTag" })),
+      ),
       Story.then(
         ws,
         new DraftSaved({
@@ -99,7 +102,7 @@ it.effect(
           savedAt: T0,
         }),
       ),
-      Story.when(ws, new SaveDraft(baseDraft({ documentId: tag2, title: "AI", kind: "taxonomyTag" }))),
+      Story.when(new SaveDraft(baseDraft({ documentId: tag2, title: "AI", kind: "taxonomyTag" }))),
       Story.then(
         ws,
         new DraftSaved({
@@ -109,20 +112,25 @@ it.effect(
         }),
       ),
       Story.when(
-        ws,
-        new SaveDraft(baseDraft({ documentId: seg1, title: "Opening Theme", kind: "segment", tagIds: [tag1] })),
+        new SaveDraft(
+          baseDraft({ documentId: seg1, title: "Opening Theme", kind: "segment", tagIds: [tag1] }),
+        ),
       ),
       Story.then(
         ws,
         new DraftSaved({
-          ...baseDraft({ documentId: seg1, title: "Opening Theme", kind: "segment", tagIds: [tag1] }),
+          ...baseDraft({
+            documentId: seg1,
+            title: "Opening Theme",
+            kind: "segment",
+            tagIds: [tag1],
+          }),
           revision: 1,
           savedAt: T0,
         }),
       ),
       // Seed internal & partner shows with the SAME slug in different ownershipType scopes (allowed!)
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: showInternal,
@@ -148,7 +156,6 @@ it.effect(
         }),
       ),
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: showPartner,
@@ -175,7 +182,6 @@ it.effect(
       ),
       // Duplicate show slug within same ownershipType -> rejected
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: DocumentId.make("show-dup"),
@@ -195,7 +201,6 @@ it.effect(
       ),
       // Audio masters: one without highlight chapter (stays draft), one playable + valid highlight chapter
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: masterDraftOnly,
@@ -223,7 +228,6 @@ it.effect(
         }),
       ),
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: masterValid,
@@ -260,7 +264,6 @@ it.effect(
       ),
       // Cross-doc multi-hop clipOnlyMode rejected on internal show
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: ep1,
@@ -279,7 +282,6 @@ it.effect(
       ),
       // Valid clipOnlyMode on partner show + masterValid succeeds
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: ep1,
@@ -315,7 +317,7 @@ it.effect(
         }),
       ),
       // Publishing ep1 WITHOUT publishing masterValid fails publish-readiness gate
-      Story.when(ws, new PublishWorkspace({ documentIds: [ep1] })),
+      Story.when(new PublishWorkspace({ workspaceId: ws.id, documentIds: [ep1] })),
       Story.rejected(
         new PublishReadinessViolation({
           documentId: ep1,
@@ -324,7 +326,9 @@ it.effect(
         }),
       ),
       // Referenced audioMaster cannot be deleted
-      Story.when(ws, new DeleteDocument({ documentId: masterValid, expectedRevision: 1 })),
+      Story.when(
+        new DeleteDocument({ workspaceId: ws.id, documentId: masterValid, expectedRevision: 1 }),
+      ),
       Story.rejected(
         new StrongReferenceViolation({
           targetId: masterValid,
@@ -334,7 +338,6 @@ it.effect(
       ),
       // Duplicate episode slug in same show rejected
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: ep2,
@@ -355,14 +358,18 @@ it.effect(
         }),
       ),
       // Atomic multi-doc publish succeeds for [showPartner, masterValid, ep1]
-      Story.when(ws, new PublishWorkspace({ documentIds: [showPartner, masterValid, ep1] })),
+      Story.when(
+        new PublishWorkspace({ workspaceId: ws.id, documentIds: [showPartner, masterValid, ep1] }),
+      ),
       Story.then(
         ws,
         new WorkspacePublished({ documentIds: [showPartner, masterValid, ep1], publishedAt: T0 }),
       ),
       Story.replied({ publishedCount: 3 }),
       // Cascading segment tag sync propagates tag2 to published ep1
-      Story.when(ws, new SyncSegmentTags({ segmentId: seg1, tagIds: [tag1, tag2] })),
+      Story.when(
+        new SyncSegmentTags({ workspaceId: ws.id, segmentId: seg1, tagIds: [tag1, tag2] }),
+      ),
       Story.then(
         ws,
         new SegmentTagsCascaded({
@@ -380,7 +387,6 @@ it.effect(
       ),
       // Discard draft restores published title
       Story.when(
-        ws,
         new SaveDraft(
           baseDraft({
             documentId: ep1,
@@ -416,7 +422,7 @@ it.effect(
           savedAt: T0,
         }),
       ),
-      Story.when(ws, new DiscardDraft({ documentId: ep1 })),
+      Story.when(new DiscardDraft({ workspaceId: ws.id, documentId: ep1 })),
       Story.then(ws, new DraftDiscarded({ documentId: ep1, restoredRevision: 1, discardedAt: T0 })),
       Story.state(ws, (s) => s.documents[ep1]?.title === "Episode 1"),
     );
@@ -434,13 +440,13 @@ it.effect(
 
     return splitStory(
       Story.clock("2026-11-20T12:00:00Z"),
-      Story.when(slot, new ClaimScheduleSlot({ documentId: doc1 })),
+      Story.when(new ClaimScheduleSlot({ slotKey: slot.id, documentId: doc1 })),
       Story.then(slot, new SlotClaimed({ documentId: doc1 })),
-      Story.when(slot, new ClaimScheduleSlot({ documentId: doc2 })),
+      Story.when(new ClaimScheduleSlot({ slotKey: slot.id, documentId: doc2 })),
       Story.rejected(new SlotAlreadyClaimed({ claimedBy: doc1 })),
       Story.when(
-        d1,
         new SaveDocumentDraft({
+          documentId: d1.id,
           workspaceId: WorkspaceId.make("ws-1"),
           expectedRevision: null,
           title: "Unvalidated Ref Episode",

@@ -47,8 +47,8 @@ const runMarketStorageProbe = (opportunities: number) =>
       const cId = CampaignId.make("camp-main");
 
       yield* market.send(
-        mId,
         new UpsertCampaign({
+          marketId: mId,
           campaignId: cId,
           name: "Primary Sponsor Campaign",
           weight: 10,
@@ -74,8 +74,12 @@ const runMarketStorageProbe = (opportunities: number) =>
       for (let i = 0; i < opportunities; i++) {
         const oppId = OpportunityId.make(`opp-${String(i).padStart(6, "0")}`);
         yield* market.send(
-          mId,
-          new AllocateOpportunity({ opportunityId: oppId, audience: "free", leaseTtlMs: 120_000 }),
+          new AllocateOpportunity({
+            marketId: mId,
+            opportunityId: oppId,
+            audience: "free",
+            leaseTtlMs: 120_000,
+          }),
           { commandId: `alloc-${i}` },
         );
 
@@ -86,8 +90,8 @@ const runMarketStorageProbe = (opportunities: number) =>
         if (i % 100 < 65) {
           const expId = ExposureId.make(`exp-${i}-p`);
           yield* market.send(
-            mId,
             new RecordExposure({
+              marketId: mId,
               exposureId: expId,
               reservationId: rPrimary,
               campaignId: cId,
@@ -102,8 +106,8 @@ const runMarketStorageProbe = (opportunities: number) =>
         if (i % 100 < 89) {
           const expId = ExposureId.make(`exp-${i}-c`);
           yield* market.send(
-            mId,
             new RecordExposure({
+              marketId: mId,
               exposureId: expId,
               reservationId: rCompanion,
               campaignId: cId,
@@ -123,7 +127,7 @@ const runMarketStorageProbe = (opportunities: number) =>
 
       // Expire the remaining unqualified holds so `activeReservations` is completely empty.
       for (const resId of unqualified) {
-        yield* market.send(mId, new ExpireLease({ reservationId: resId }), {
+        yield* market.send(new ExpireLease({ marketId: mId, reservationId: resId }), {
           commandId: `expire-run:${resId}`,
         });
       }
@@ -154,8 +158,8 @@ const runMarketStorageProbe = (opportunities: number) =>
         putKeysPerOpp: +(totalPutKeys / opportunities).toFixed(1),
         putBytesPerOpp: Math.round(marketMetric.totalPutBytes / opportunities),
         bytesPerOpp: Math.round(bytesPerOpp),
-        daysTo10GbAt1x: +((doLimitBytes / (bytesPerOpp * (monthlyOpps1x / 30)))).toFixed(1),
-        daysTo10GbAt10x: +((doLimitBytes / (bytesPerOpp * (monthlyOpps10x / 30)))).toFixed(2),
+        daysTo10GbAt1x: +(doLimitBytes / (bytesPerOpp * (monthlyOpps1x / 30))).toFixed(1),
+        daysTo10GbAt10x: +(doLimitBytes / (bytesPerOpp * (monthlyOpps10x / 30))).toFixed(2),
         monthlyPutKeys1xM: +(((totalPutKeys / opportunities) * monthlyOpps1x) / 1e6).toFixed(1),
         monthlyPutKeys10xM: +(((totalPutKeys / opportunities) * monthlyOpps10x) / 1e6).toFixed(1),
       };

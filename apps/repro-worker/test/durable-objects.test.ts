@@ -18,6 +18,7 @@ import { expect } from "vitest";
 import { createInstrumentedDoPlatform } from "../scripts/instrumented-do-platform.ts";
 
 const podcastDraft = (overrides: {
+  workspaceId?: WorkspaceId;
   documentId: DocumentId;
   expectedRevision: number | null;
   title: string;
@@ -28,6 +29,7 @@ const podcastDraft = (overrides: {
   releaseDate?: string | null;
   bodyHash: string;
 }) => ({
+  workspaceId: overrides.workspaceId ?? WorkspaceId.make("ws-default"),
   documentId: overrides.documentId,
   expectedRevision: overrides.expectedRevision,
   title: overrides.title,
@@ -56,19 +58,17 @@ const podcastDraft = (overrides: {
 it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", () =>
   Effect.gen(function* () {
     const host = createInstrumentedDoPlatform();
-    const layer = WorkspaceCms.layer(
-      WorkspaceCmsHandlers.pipe(Layer.provide(MemoryCatalogStore)),
-      { legacyData: false },
-    ).pipe(Layer.provide(host.layer));
+    const layer = WorkspaceCms.layer(WorkspaceCmsHandlers.pipe(Layer.provide(MemoryCatalogStore)), {
+      legacyData: false,
+    }).pipe(Layer.provide(host.layer));
 
     yield* Effect.gen(function* () {
       const workspace = yield* Workspace;
       const wsId = WorkspaceId.make("test-ws");
       const showId = DocumentId.make("show-0");
       yield* workspace.send(
-        wsId,
-        new SaveDraft(
-          podcastDraft({
+        new SaveDraft({
+          ...podcastDraft({
             documentId: showId,
             expectedRevision: null,
             title: "Main Show",
@@ -77,14 +77,14 @@ it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", ()
             ownershipType: "internal",
             bodyHash: "sha256:show-0",
           }),
-        ),
+          workspaceId: wsId,
+        }),
         { commandId: "seed-show" },
       );
       for (let i = 0; i < 40; i++) {
         yield* workspace.send(
-          wsId,
-          new SaveDraft(
-            podcastDraft({
+          new SaveDraft({
+            ...podcastDraft({
               documentId: DocumentId.make(`ep-${i}`),
               expectedRevision: null,
               title: `Episode ${i}`,
@@ -94,7 +94,8 @@ it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", ()
               releaseDate: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10),
               bodyHash: `sha256:${String(i).padStart(64, "0")}`,
             }),
-          ),
+            workspaceId: wsId,
+          }),
           { commandId: `seed-${i}` },
         );
       }
@@ -102,9 +103,8 @@ it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", ()
       host.resetCounters();
 
       yield* workspace.send(
-        wsId,
-        new SaveDraft(
-          podcastDraft({
+        new SaveDraft({
+          ...podcastDraft({
             documentId: DocumentId.make("ep-0"),
             expectedRevision: 1,
             title: "Episode 0 Edited",
@@ -114,7 +114,8 @@ it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", ()
             releaseDate: "2026-01-01",
             bodyHash: `sha256:${"0".padStart(64, "0")}`,
           }),
-        ),
+          workspaceId: wsId,
+        }),
         { commandId: "edit-0" },
       );
       yield* host.drainBackground;
@@ -139,8 +140,8 @@ it.live("Quota Market DO + ScheduleLeaseExpiry accumulates per-reservation callb
       const market = yield* Market;
       const mId = MarketId.make("test-market");
       yield* market.send(
-        mId,
         new UpsertCampaign({
+          marketId: mId,
           campaignId: CampaignId.make("camp-1"),
           name: "Test Sponsor",
           weight: 10,
@@ -160,8 +161,8 @@ it.live("Quota Market DO + ScheduleLeaseExpiry accumulates per-reservation callb
 
       for (let i = 0; i < 10; i++) {
         yield* market.send(
-          mId,
           new AllocateOpportunity({
+            marketId: mId,
             opportunityId: OpportunityId.make(`opp-${i}`),
             audience: "free",
             leaseTtlMs: 60_000,
@@ -184,17 +185,16 @@ it.live("Quota Market DO + ScheduleLeaseExpiry accumulates per-reservation callb
 it.live("WorkspaceCmsApi supports read-your-writes Query via atLeast", () =>
   Effect.gen(function* () {
     const host = createInstrumentedDoPlatform();
-    const layer = WorkspaceCms.layer(
-      WorkspaceCmsHandlers.pipe(Layer.provide(MemoryCatalogStore)),
-      { legacyData: false },
-    ).pipe(Layer.provide(host.layer));
+    const layer = WorkspaceCms.layer(WorkspaceCmsHandlers.pipe(Layer.provide(MemoryCatalogStore)), {
+      legacyData: false,
+    }).pipe(Layer.provide(host.layer));
 
     yield* Effect.gen(function* () {
       const api = yield* WorkspaceCmsApi.clientInProcess;
       const wsId = WorkspaceId.make("ws-api");
       const receipt = yield* api.SaveDraft(
-        wsId,
         podcastDraft({
+          workspaceId: wsId,
           documentId: DocumentId.make("ep-ryw"),
           expectedRevision: null,
           title: "Indexed Podcast Episode",

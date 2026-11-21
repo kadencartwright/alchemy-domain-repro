@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "bootstrap": "bash scripts/bootstrap-alchemy.sh",
     "dev": "pnpm --filter @repro/worker dev",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",

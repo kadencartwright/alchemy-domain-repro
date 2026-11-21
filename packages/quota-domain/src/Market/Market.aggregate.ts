@@ -60,6 +60,7 @@ export class Market extends Domain.Aggregate("Market", {
   state: MarketState,
   initial: initialMarketState,
   commands: [UpsertCampaign, AllocateOpportunity, RecordExposure, ExpireLease, FinalizeInvoice],
+  keyOf: (cmd) => cmd.marketId,
   decide: {
     UpsertCampaign: (_state, cmd) => {
       const { _tag: _, ...fields } = cmd;
@@ -293,10 +294,13 @@ export const ScheduleLeaseExpiryLive = ScheduleLeaseExpiry.toLayer(
     const market = yield* Market;
     return Effect.fn(function* ({ source, event }) {
       for (const res of event.reservations) {
-        yield* market.schedule(source.id, new ExpireLease({ reservationId: res.reservationId }), {
-          at: DateTime.makeUnsafe(res.expiresAt),
-          commandId: `expire:${res.reservationId}`,
-        });
+        yield* market.schedule(
+          new ExpireLease({ marketId: source.id, reservationId: res.reservationId }),
+          {
+            at: DateTime.makeUnsafe(res.expiresAt),
+            commandId: `expire:${res.reservationId}`,
+          },
+        );
       }
     });
   }),

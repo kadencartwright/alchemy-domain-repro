@@ -116,6 +116,7 @@ export class Workspace extends Domain.Aggregate("Workspace", {
     SyncSegmentTags,
     DiscardDraft,
   ],
+  keyOf: (cmd) => cmd.workspaceId,
   decide: {
     SaveDraft: (state, cmd, ctx) => {
       const existing = state.documents[cmd.documentId];

@@ -52,8 +52,8 @@ export class CampaignExposureRecorded extends Domain.Event("CampaignExposureReco
 }) {}
 
 export class ConfigureCampaign extends Domain.Command("ConfigureCampaign", {
-  target: CampaignId,
   input: {
+    campaignId: CampaignId,
     name: Schema.String,
     weight: Schema.Int,
     audience: Audience,
@@ -72,8 +72,8 @@ export class ConfigureCampaign extends Domain.Command("ConfigureCampaign", {
 }) {}
 
 export class ReserveCampaignSlots extends Domain.Command("ReserveCampaignSlots", {
-  target: CampaignId,
   input: {
+    campaignId: CampaignId,
     opportunityId: OpportunityId,
     audience: Schema.Literals(["free", "paid"]),
     leaseTtlMs: Schema.Int,
@@ -84,8 +84,8 @@ export class ReserveCampaignSlots extends Domain.Command("ReserveCampaignSlots",
 }) {}
 
 export class RecordCampaignExposure extends Domain.Command("RecordCampaignExposure", {
-  target: CampaignId,
   input: {
+    campaignId: CampaignId,
     exposureId: ExposureId,
     reservationId: ReservationId,
     placement: Placement,
@@ -115,6 +115,7 @@ export class Campaign extends Domain.Aggregate("Campaign", {
   state: CampaignAggregateState,
   initial: { config: null, activeReservations: {} },
   commands: [ConfigureCampaign, ReserveCampaignSlots, RecordCampaignExposure],
+  keyOf: (cmd) => cmd.campaignId,
   decide: {
     ConfigureCampaign: (_state, cmd) => {
       const { _tag: _, ...fields } = cmd;
@@ -156,10 +157,10 @@ export class Campaign extends Domain.Aggregate("Campaign", {
     },
   },
   evolve: {
-    CampaignConfigured: (state, e) => ({
+    CampaignConfigured: (state, e, envelope) => ({
       ...state,
       config: {
-        id: state.config?.id ?? CampaignId.make(e.name),
+        id: envelope.id,
         name: e.name,
         weight: e.weight,
         audience: e.audience,

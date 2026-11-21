@@ -15,12 +15,17 @@ import type { DocumentMeta } from "@repro/cms-domain/Workspace/WorkspaceState";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { generateCmsTape, SQLITE_DO_SINGLE_VALUE_LIMIT_BYTES } from "../benchmarks/synthetic-tapes.ts";
+import {
+  generateCmsTape,
+  SQLITE_DO_SINGLE_VALUE_LIMIT_BYTES,
+} from "../benchmarks/synthetic-tapes.ts";
 import { createInstrumentedDoPlatform } from "./instrumented-do-platform.ts";
 
 const formatKB = (bytes: number) => `${(bytes / 1024).toFixed(1)} KiB`;
 
-const toDocumentMeta = (d: ReturnType<typeof generateCmsTape>["seedDocs"][number]): DocumentMeta => ({
+const toDocumentMeta = (
+  d: ReturnType<typeof generateCmsTape>["seedDocs"][number],
+): DocumentMeta => ({
   id: DocumentId.make(d.documentId),
   title: d.title,
   kind: d.kind,
@@ -66,8 +71,10 @@ const runWorkspaceScalingProbe = (docCount: number) =>
       const wsId = WorkspaceId.make(`ws-${docCount}`);
 
       yield* workspace.send(
-        wsId,
-        new BulkImportDocuments({ documents: tape.seedDocs.map(toDocumentMeta) }),
+        new BulkImportDocuments({
+          workspaceId: wsId,
+          documents: tape.seedDocs.map(toDocumentMeta),
+        }),
         { commandId: `bulk-${docCount}` },
       );
       yield* host.drainBackground;
@@ -78,8 +85,8 @@ const runWorkspaceScalingProbe = (docCount: number) =>
       const t0 = performance.now();
       for (let e = 0; e < edits; e++) {
         yield* workspace.send(
-          wsId,
           new SaveDraft({
+            workspaceId: wsId,
             documentId: DocumentId.make(editDoc.documentId),
             expectedRevision: 1 + e,
             title: `${editDoc.title} (rev ${2 + e})`,
@@ -138,8 +145,8 @@ const runSplitComparisonProbe = () =>
       const docId = DocumentId.make("ep-00000");
 
       yield* docs.send(
-        docId,
         new SaveDocumentDraft({
+          documentId: docId,
           workspaceId: wsId,
           expectedRevision: null,
           title: "Podcast Episode #0",
@@ -155,8 +162,8 @@ const runSplitComparisonProbe = () =>
       const t0 = performance.now();
       for (let e = 0; e < edits; e++) {
         yield* docs.send(
-          docId,
           new SaveDocumentDraft({
+            documentId: docId,
             workspaceId: wsId,
             expectedRevision: 1 + e,
             title: `Podcast Episode #0 (rev ${2 + e})`,
@@ -195,8 +202,8 @@ const runReadYourWritesProbe = () =>
 
       const t0 = performance.now();
       const receipt = yield* api.SaveDraft(
-        wsId,
         {
+          workspaceId: wsId,
           documentId: docId,
           expectedRevision: null,
           title: "Freshly Saved Episode",
@@ -246,7 +253,9 @@ const runReadYourWritesProbe = () =>
 const main = Effect.gen(function* () {
   console.log("=== Case 2: Podcast Network CMS Probes (up to 25,000 docs on DurableObjects) ===\n");
   const sizes = [100, 500, 2_500, 25_000];
-  console.log("| Docs | `meta` size | % of 2 MiB SQLite DO cap | Put bytes/edit | ms/edit (local SQLite) |");
+  console.log(
+    "| Docs | `meta` size | % of 2 MiB SQLite DO cap | Put bytes/edit | ms/edit (local SQLite) |",
+  );
   console.log("|---:|---:|---:|---:|---:|");
 
   for (const n of sizes) {
@@ -262,7 +271,9 @@ const main = Effect.gen(function* () {
     `  meta=${formatKB(split.metaBytes)}, putBytes/edit=${formatKB(split.putBytesPerEdit)}, ms/edit=${split.msPerEdit.toFixed(2)} ms`,
   );
 
-  console.log("\nRead-your-writes via Domain.Query `atLeast` (5 ms commit + 5 ms RPC, 25 ms batch wait):");
+  console.log(
+    "\nRead-your-writes via Domain.Query `atLeast` (5 ms commit + 5 ms RPC, 25 ms batch wait):",
+  );
   const ryw = yield* runReadYourWritesProbe();
   console.log(
     `  SaveDraft=${ryw.saveMs} ms, SearchCatalog(atLeast)=${ryw.queryCatchUpMs} ms, rows=${ryw.matchedRows}`,

@@ -33,8 +33,8 @@ export class DocumentPublished extends Domain.Event("DocumentPublished", {
 }) {}
 
 export class SaveDocumentDraft extends Domain.Command("SaveDocumentDraft", {
-  target: DocumentId,
   input: {
+    documentId: DocumentId,
     workspaceId: WorkspaceId,
     expectedRevision: Schema.NullOr(Revision),
     title: Schema.String,
@@ -48,8 +48,7 @@ export class SaveDocumentDraft extends Domain.Command("SaveDocumentDraft", {
 }) {}
 
 export class PublishDocument extends Domain.Command("PublishDocument", {
-  target: DocumentId,
-  input: {},
+  input: { documentId: DocumentId },
   events: [DocumentPublished],
   rejects: [],
   reply: { publishedRevision: Revision },
@@ -64,16 +63,14 @@ export class SlotReleased extends Domain.Event("SlotReleased", {
 }) {}
 
 export class ClaimScheduleSlot extends Domain.Command("ClaimScheduleSlot", {
-  target: SlotKey,
-  input: { documentId: DocumentId },
+  input: { slotKey: SlotKey, documentId: DocumentId },
   events: [SlotClaimed],
   rejects: [SlotAlreadyClaimed],
   reply: { documentId: DocumentId },
 }) {}
 
 export class ReleaseScheduleSlot extends Domain.Command("ReleaseScheduleSlot", {
-  target: SlotKey,
-  input: { documentId: DocumentId },
+  input: { slotKey: SlotKey, documentId: DocumentId },
   events: [SlotReleased],
   rejects: [],
 }) {}

@@ -79,8 +79,8 @@ export class DraftDiscarded extends Domain.Event("DraftDiscarded", {
 }) {}
 
 export class SaveDraft extends Domain.Command("SaveDraft", {
-  target: WorkspaceId,
   input: {
+    workspaceId: WorkspaceId,
     ...DraftPayloadFields,
     expectedRevision: Schema.NullOr(Revision),
   },
@@ -97,8 +97,8 @@ export class SaveDraft extends Domain.Command("SaveDraft", {
 
 /** Realistic bulk-import command (analogous to CSV / series episode batch import). */
 export class BulkImportDocuments extends Domain.Command("BulkImportDocuments", {
-  target: WorkspaceId,
   input: {
+    workspaceId: WorkspaceId,
     documents: Schema.Array(DocumentMeta),
   },
   events: [CorpusBatchImported],
@@ -107,8 +107,8 @@ export class BulkImportDocuments extends Domain.Command("BulkImportDocuments", {
 }) {}
 
 export class DeleteDocument extends Domain.Command("DeleteDocument", {
-  target: WorkspaceId,
   input: {
+    workspaceId: WorkspaceId,
     documentId: DocumentId,
     expectedRevision: Revision,
   },
@@ -118,8 +118,8 @@ export class DeleteDocument extends Domain.Command("DeleteDocument", {
 }) {}
 
 export class PublishWorkspace extends Domain.Command("PublishWorkspace", {
-  target: WorkspaceId,
   input: {
+    workspaceId: WorkspaceId,
     documentIds: Schema.Array(DocumentId),
   },
   events: [WorkspacePublished],
@@ -137,8 +137,8 @@ export class PublishWorkspace extends Domain.Command("PublishWorkspace", {
  * published `episode` whose primary segment (`segmentIds[0]`) is this segment.
  */
 export class SyncSegmentTags extends Domain.Command("SyncSegmentTags", {
-  target: WorkspaceId,
   input: {
+    workspaceId: WorkspaceId,
     segmentId: DocumentId,
     tagIds: Schema.Array(DocumentId),
   },
@@ -148,8 +148,8 @@ export class SyncSegmentTags extends Domain.Command("SyncSegmentTags", {
 }) {}
 
 export class DiscardDraft extends Domain.Command("DiscardDraft", {
-  target: WorkspaceId,
   input: {
+    workspaceId: WorkspaceId,
     documentId: DocumentId,
   },
   events: [DraftDiscarded],

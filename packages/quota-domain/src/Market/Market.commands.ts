@@ -61,8 +61,8 @@ export class InvoiceFinalized extends Domain.Event("InvoiceFinalized", {
 }) {}
 
 export class UpsertCampaign extends Domain.Command("UpsertCampaign", {
-  target: MarketId,
   input: {
+    marketId: MarketId,
     campaignId: CampaignId,
     name: Schema.String,
     weight: Schema.Int,
@@ -82,8 +82,8 @@ export class UpsertCampaign extends Domain.Command("UpsertCampaign", {
 }) {}
 
 export class AllocateOpportunity extends Domain.Command("AllocateOpportunity", {
-  target: MarketId,
   input: {
+    marketId: MarketId,
     opportunityId: OpportunityId,
     audience: Schema.Literals(["free", "paid"]),
     leaseTtlMs: Schema.Int,
@@ -105,8 +105,8 @@ export class AllocateOpportunity extends Domain.Command("AllocateOpportunity", {
  * inside aggregate `"meta"`.
  */
 export class RecordExposure extends Domain.Command("RecordExposure", {
-  target: MarketId,
   input: {
+    marketId: MarketId,
     exposureId: ExposureId,
     reservationId: ReservationId,
     campaignId: CampaignId,
@@ -119,8 +119,8 @@ export class RecordExposure extends Domain.Command("RecordExposure", {
 
 /** Scheduled by LeaseExpiry policy; cannot reject so it can be scheduled. */
 export class ExpireLease extends Domain.Command("ExpireLease", {
-  target: MarketId,
   input: {
+    marketId: MarketId,
     reservationId: ReservationId,
   },
   events: [LeaseExpired],
@@ -128,8 +128,8 @@ export class ExpireLease extends Domain.Command("ExpireLease", {
 }) {}
 
 export class FinalizeInvoice extends Domain.Command("FinalizeInvoice", {
-  target: MarketId,
   input: {
+    marketId: MarketId,
     campaignId: CampaignId,
   },
   events: [InvoiceFinalized],

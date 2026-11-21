@@ -41,8 +41,8 @@ export class GrantPartitioned extends Domain.Event("GrantPartitioned", {
 }) {}
 
 export class PartitionCampaignGrants extends Domain.Command("PartitionCampaignGrants", {
-  target: CampaignId,
   input: {
+    campaignId: CampaignId,
     name: Schema.String,
     weight: Schema.Int,
     audience: Audience,
@@ -76,6 +76,7 @@ export class Treasury extends Domain.Aggregate("Treasury", {
   state: TreasuryState,
   initial: { totalTargets: null, grantsByCell: {} },
   commands: [PartitionCampaignGrants],
+  keyOf: (cmd) => cmd.campaignId,
   decide: {
     PartitionCampaignGrants: (_state, cmd, ctx) => {
       const n = Math.max(1, cmd.cellIds.length);
@@ -160,8 +161,8 @@ export class CellExposureAccounted extends Domain.Event("CellExposureAccounted",
 }) {}
 
 export class InstallCellGrant extends Domain.Command("InstallCellGrant", {
-  target: CellId,
   input: {
+    cellId: CellId,
     campaignId: CampaignId,
     name: Schema.String,
     weight: Schema.Int,
@@ -180,8 +181,8 @@ export class InstallCellGrant extends Domain.Command("InstallCellGrant", {
 }) {}
 
 export class AllocateInCell extends Domain.Command("AllocateInCell", {
-  target: CellId,
   input: {
+    cellId: CellId,
     opportunityId: OpportunityId,
     audience: Schema.Literals(["free", "paid"]),
     leaseTtlMs: Schema.Int,
@@ -195,8 +196,8 @@ export class AllocateInCell extends Domain.Command("AllocateInCell", {
 }) {}
 
 export class RecordCellExposure extends Domain.Command("RecordCellExposure", {
-  target: CellId,
   input: {
+    cellId: CellId,
     exposureId: ExposureId,
     reservationId: ReservationId,
     campaignId: CampaignId,
@@ -226,6 +227,7 @@ export class AllocationCell extends Domain.Aggregate("AllocationCell", {
   state: CellState,
   initial: { campaigns: {}, activeReservations: {} },
   commands: [InstallCellGrant, AllocateInCell, RecordCellExposure],
+  keyOf: (cmd) => cmd.cellId,
   decide: {
     InstallCellGrant: (_state, cmd) => {
       const { _tag: _, ...fields } = cmd;
@@ -372,24 +374,26 @@ export const DistributeGrantsLive = DistributeGrants.toLayer(
     const cells = yield* AllocationCell;
     return Effect.fn(function* ({ event }) {
       for (const grant of event.grants) {
-        yield* cells.send(
-          grant.cellId,
-          new InstallCellGrant({
-            campaignId: event.campaignId,
-            name: event.name,
-            weight: event.weight,
-            audience: event.audience,
-            startAt: event.startAt,
-            endAt: event.endAt,
-            bundlePriceCents: event.bundlePriceCents,
-            creativeVersion: event.creativeVersion,
-            requireCompanion: event.requireCompanion,
-            standalonePrimaryApproved: event.standalonePrimaryApproved,
-            standaloneCompanionApproved: event.standaloneCompanionApproved,
-            targets: grant.targets,
-          }),
-          { commandId: `grant:${event.campaignId}:${grant.cellId}` },
-        );
+        yield* cells
+          .send(
+            new InstallCellGrant({
+              cellId: grant.cellId,
+              campaignId: event.campaignId,
+              name: event.name,
+              weight: event.weight,
+              audience: event.audience,
+              startAt: event.startAt,
+              endAt: event.endAt,
+              bundlePriceCents: event.bundlePriceCents,
+              creativeVersion: event.creativeVersion,
+              requireCompanion: event.requireCompanion,
+              standalonePrimaryApproved: event.standalonePrimaryApproved,
+              standaloneCompanionApproved: event.standaloneCompanionApproved,
+              targets: grant.targets,
+            }),
+            { commandId: `grant:${event.campaignId}:${grant.cellId}` },
+          )
+          .pipe(Effect.orDie);
       }
     });
   }),

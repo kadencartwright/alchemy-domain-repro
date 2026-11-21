@@ -5,3 +5,4 @@ dist/
 .vitest/
 *.log
 .DS_Store
+vendor/

@@ -265,8 +265,7 @@ export const createInstrumentedDoPlatform = (options: InstrumentedHostOptions = 
             env: {},
             get: () => Effect.succeed(undefined),
             set: (id) => Effect.succeed(id),
-            makeCallback: callbacks.makeCallback,
-          };
+          } as BaseRuntimeContext;
 
           const objectState: ObjectStateShape = {
             storage,
@@ -291,6 +290,7 @@ export const createInstrumentedDoPlatform = (options: InstrumentedHostOptions = 
             Effect.provideService(ObjectState, objectState),
             Effect.provideService(RuntimeContext, runtimeCtx),
             Effect.provideService(Scope.Scope, scope),
+            Effect.provide(callbacks.callbacks),
           );
 
           const instance: InternalInstance = {
@@ -309,7 +309,7 @@ export const createInstrumentedDoPlatform = (options: InstrumentedHostOptions = 
           };
           instances.set(mapKey, instance);
           return instance;
-        }),
+        }) as Effect.Effect<InternalInstance>,
       );
 
       pendingCreation.set(mapKey, promise);
@@ -329,22 +329,24 @@ export const createInstrumentedDoPlatform = (options: InstrumentedHostOptions = 
         return {
           getByName: (instanceName: string): Stub =>
             new Proxy({} as Stub, {
-              get: (_target, prop: string) => (...args: ReadonlyArray<unknown>) =>
-                Effect.gen(function* () {
-                  if (rpcDelayMs > 0) {
-                    yield* Effect.sleep(`${rpcDelayMs} millis`);
-                  }
-                  const inst = yield* getOrCreate(full, instanceName, impl);
-                  const fn = inst.methods[prop];
-                  if (typeof fn !== "function") {
-                    return yield* Effect.die(
-                      new Error(`DO ${full}/${instanceName} has no method ${String(prop)}`),
+              get:
+                (_target, prop: string) =>
+                (...args: ReadonlyArray<unknown>) =>
+                  Effect.gen(function* () {
+                    if (rpcDelayMs > 0) {
+                      yield* Effect.sleep(`${rpcDelayMs} millis`);
+                    }
+                    const inst = yield* getOrCreate(full, instanceName, impl);
+                    const fn = inst.methods[prop];
+                    if (typeof fn !== "function") {
+                      return yield* Effect.die(
+                        new Error(`DO ${full}/${instanceName} has no method ${String(prop)}`),
+                      );
+                    }
+                    return yield* (fn as (...a: ReadonlyArray<unknown>) => Effect.Effect<unknown>)(
+                      ...args,
                     );
-                  }
-                  return yield* (fn as (...a: ReadonlyArray<unknown>) => Effect.Effect<unknown>)(
-                    ...args,
-                  );
-                }),
+                  }),
             }),
         };
       }),
