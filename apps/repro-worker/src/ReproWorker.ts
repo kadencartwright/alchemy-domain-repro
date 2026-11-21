@@ -19,7 +19,6 @@ import {
   DeleteDocument,
   PublishWorkspace,
   SaveDraft,
-  SyncSegmentTags,
 } from "@repro/cms-domain/Workspace/Workspace.commands";
 import { WorkspaceCms, WorkspaceCmsHandlers } from "@repro/cms-domain/Workspace/Workspace.model";
 import type { DocumentMeta } from "@repro/cms-domain/Workspace/WorkspaceState";
@@ -393,7 +392,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
               chapters: body.chapters ?? [],
               segmentIds: toIds(body.segmentIds),
               hostIds: toIds(body.hostIds),
-              tagIds: toIds(body.tagIds),
               managedLinkIds: toIds(body.managedLinkIds),
               mediaAssetIds: toIds(body.mediaAssetIds),
               bodyHash: body.bodyHash ?? "sha256:0",
@@ -478,26 +476,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
             }),
           );
       }
-      if (url.pathname === "/cms/workspace/sync-tags") {
-        return yield* workspace
-          .send(
-            new SyncSegmentTags({
-              workspaceId: WorkspaceId.make(body.workspaceId),
-              segmentId: DocumentId.make(body.segmentId),
-              tagIds: (body.tagIds as ReadonlyArray<string>).map((id) => DocumentId.make(id)),
-            }),
-            { commandId: body.commandId },
-          )
-          .pipe(
-            Effect.flatMap((r) => HttpServerResponse.json({ ok: true, reply: r.reply })),
-            Effect.catchTags({
-              DocumentNotFound: (e) =>
-                HttpServerResponse.json({ ok: false, error: e }, { status: 404 }),
-              StrongReferenceViolation: (e) =>
-                HttpServerResponse.json({ ok: false, error: e }, { status: 409 }),
-            }),
-          );
-      }
 
       if (url.pathname === "/cms/document/save") {
         return yield* doc
@@ -562,7 +540,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
             chapters: body.chapters ?? [],
             segmentIds: toIds(body.segmentIds),
             hostIds: toIds(body.hostIds),
-            tagIds: toIds(body.tagIds),
             managedLinkIds: toIds(body.managedLinkIds),
             mediaAssetIds: toIds(body.mediaAssetIds),
             bodyHash: body.bodyHash ?? "sha256:0",
@@ -584,11 +561,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
         }
         if (url.pathname === "/cms/decision/publish") {
           return yield* respond(decisionCms.publish(toIds(body.documentIds), options));
-        }
-        if (url.pathname === "/cms/decision/sync-tags") {
-          return yield* respond(
-            decisionCms.syncTags(DocumentId.make(body.segmentId), toIds(body.tagIds), options),
-          );
         }
         if (url.pathname === "/cms/decision/get") {
           const doc = yield* decisionCms.get(DocumentId.make(body.documentId));
@@ -630,7 +602,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
                 audioMasterId: body.audioMasterId ? DocumentId.make(body.audioMasterId) : null,
                 segmentIds: toIds(body.segmentIds),
                 hostIds: toIds(body.hostIds),
-                tagIds: toIds(body.tagIds),
                 managedLinkIds: toIds(body.managedLinkIds),
                 mediaAssetIds: toIds(body.mediaAssetIds),
               },
@@ -680,7 +651,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
                 expectedRevision: body.expectedRevision ?? null,
                 kind: body.kind,
                 title: body.title,
-                tagIds: toIds(body.tagIds),
               }),
               options,
             ),
@@ -701,10 +671,6 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
         if (url.pathname === "/cms/content/get-item") {
           const item = yield* content.library.get(DocumentId.make(body.itemId));
           return yield* HttpServerResponse.json({ ok: true, item });
-        }
-        if (url.pathname === "/cms/content/effective-tags") {
-          const tagIds = yield* content.effectiveTags(DocumentId.make(body.episodeId));
-          return yield* HttpServerResponse.json({ ok: true, tagIds });
         }
       }
 

@@ -5,10 +5,8 @@ import {
   AudioMaster,
   AudioMasterImported,
   EditEpisodeDraft,
-  effectiveTagsOf,
   Episode,
   EpisodeImported,
-  type EpisodeState,
   HandleTaken,
   handleOf,
   LibraryItem,
@@ -95,21 +93,12 @@ export const ContentClient = Effect.gen(function* () {
           options,
         ),
       ),
-    /** Invariant 8b, restated: an episode's tags come from its primary segment when read. */
-    effectiveTags: (episodeId: DocumentId) =>
-      Effect.gen(function* () {
-        const ep: EpisodeState = yield* episodes.get(episodeId);
-        const segmentId = ep?.segmentIds[0];
-        const segment = segmentId === undefined ? null : yield* library.get(segmentId);
-        return effectiveTagsOf(ep, segment);
-      }),
   };
 });
 
 const LIBRARY_KINDS = new Set<string>([
   "segment",
   "host",
-  "taxonomyTag",
   "managedLink",
   "mediaAsset",
   "channelWelcome",
@@ -156,7 +145,6 @@ export const contentSeedOf = (documents: ReadonlyArray<DocumentMeta>) => {
         audioMasterId: d.audioMasterId,
         segmentIds: d.segmentIds,
         hostIds: d.hostIds,
-        tagIds: d.tagIds,
         managedLinkIds: d.managedLinkIds,
         mediaAssetIds: d.mediaAssetIds,
         showIds: d.showIds,
@@ -187,7 +175,6 @@ export const contentSeedOf = (documents: ReadonlyArray<DocumentMeta>) => {
       item: {
         kind: d.kind as LibraryKind,
         title: d.title,
-        tagIds: d.tagIds,
         retired: d.retiredAt !== null,
         revision: d.revision,
       },

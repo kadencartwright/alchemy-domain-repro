@@ -213,7 +213,7 @@ export class Scheduling extends Domain.Decision(ScheduleEpisode, {
   },
 }) {}
 
-// --- Publishing an episode: invariants 4–8a, restated as publish rules ---
+// --- Publishing an episode: invariants 4–8, restated as publish rules ----
 
 export class PublishEpisode extends Domain.Command("PublishEpisode", {
   input: {
@@ -222,7 +222,7 @@ export class PublishEpisode extends Domain.Command("PublishEpisode", {
     audioMasterId: Schema.NullOr(DocumentId),
     showIds: Schema.Array(DocumentId),
     libraryIds: Schema.Array(DocumentId),
-    /** Publish its audio master in the same step (invariant 8a). */
+    /** Publish its audio master in the same step (invariant 8). */
     publishAudioMaster: Schema.Boolean,
   },
   events: [EpisodePublished, AudioMasterPublished],

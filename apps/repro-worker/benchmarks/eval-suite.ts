@@ -9,8 +9,6 @@ import {
   CmsDocumentImported,
   InboundRefs,
   InboundRefsImported,
-  SegmentEpisodes,
-  SegmentEpisodesImported,
   UniqueClaim,
 } from "@repro/cms-domain/Decision/DecisionCms.aggregates";
 import { seedPlanOf } from "@repro/cms-domain/Decision/DecisionCms.client";
@@ -1020,7 +1018,6 @@ const allRefsOfDoc = (d: SyntheticPodcastDoc): Array<DocumentId> => {
     ...(d.audioMasterId ? [d.audioMasterId] : []),
     ...d.segmentIds,
     ...d.hostIds,
-    ...d.tagIds,
     ...d.managedLinkIds,
     ...d.mediaAssetIds,
     ...d.strongRefs,
@@ -1044,7 +1041,6 @@ const toDocumentMeta = (d: SyntheticPodcastDoc): DocumentMeta => ({
   chapters: d.chapters,
   segmentIds: d.segmentIds.map((id) => DocumentId.make(id)),
   hostIds: d.hostIds.map((id) => DocumentId.make(id)),
-  tagIds: d.tagIds.map((id) => DocumentId.make(id)),
   managedLinkIds: d.managedLinkIds.map((id) => DocumentId.make(id)),
   mediaAssetIds: d.mediaAssetIds.map((id) => DocumentId.make(id)),
   bodyHash: d.bodyHash,
@@ -1218,14 +1214,10 @@ const runCmsCandidatesOnWorkerd = async (
     audioMasterId: f.noHighlightMasterId,
     clipOnlyMode: true,
   });
-  const m8a = await postJson("/cms/workspace/publish", {
+  const m8 = await postJson("/cms/workspace/publish", {
     workspaceId: wsId,
     documentIds: [f.draftOnlyMasterId, "ep-unpub-master"],
   });
-  const m8b = await postJson<{ ok: boolean; reply?: { updatedEpisodeIds: Array<string> } }>(
-    "/cms/workspace/sync-tags",
-    { workspaceId: wsId, segmentId: f.primarySegmentId, tagIds: [f.secondaryTagId] },
-  );
   const mChecks = [
     m1.status === 409,
     m2.status === 409,
@@ -1234,7 +1226,7 @@ const runCmsCandidatesOnWorkerd = async (
     m5.status === 409,
     m6.status === 409,
     m7a.status === 409 && m7b.status === 409,
-    m8a.status === 200 && Boolean(m8b.data.reply?.updatedEpisodeIds.includes(f.editEpisodeId)),
+    m8.status === 200,
   ];
   const mInvariants: CmsInvariantResults = {
     staleRevisionRejected: mChecks[0]!,
@@ -1244,7 +1236,7 @@ const runCmsCandidatesOnWorkerd = async (
     deleteInUseRejected: mChecks[4]!,
     unpublishedAudioMasterRejected: mChecks[5]!,
     clipOnlyRuleRejected: mChecks[6]!,
-    atomicPublishAndTagCascadeSucceeded: mChecks[7]!,
+    atomicPublishSucceeded: mChecks[7]!,
     passedCount: mChecks.filter(Boolean).length,
   };
   const mLats: Array<number> = [];
@@ -1312,7 +1304,7 @@ const runCmsCandidatesOnWorkerd = async (
     deleteInUseRejected: false,
     unpublishedAudioMasterRejected: false,
     clipOnlyRuleRejected: false,
-    atomicPublishAndTagCascadeSucceeded: false,
+    atomicPublishSucceeded: false,
     passedCount: [s1.status === 409, s4.status === 409].filter(Boolean).length,
   };
   const sLats: Array<number> = [];
@@ -1366,7 +1358,6 @@ const namespaceDoc = (d: DocumentMeta, p: string): DocumentMeta => {
     audioMasterId: d.audioMasterId === null ? null : n(d.audioMasterId),
     segmentIds: d.segmentIds.map(n),
     hostIds: d.hostIds.map(n),
-    tagIds: d.tagIds.map(n),
     managedLinkIds: d.managedLinkIds.map(n),
     mediaAssetIds: d.mediaAssetIds.map(n),
     strongRefs: d.strongRefs.map(n),
@@ -1378,8 +1369,8 @@ const namespaceDoc = (d: DocumentMeta, p: string): DocumentMeta => {
 /**
  * Exact `"meta"` bytes of the heaviest instance of each Topology E aggregate
  * across the full 25,000-doc corpus, on the instrumented SQLite DO platform:
- * the most-referenced document's `InboundRefs`, the busiest segment's
- * `SegmentEpisodes`, and the autosaved episode's `CmsDocument`.
+ * the most-referenced document's `InboundRefs` and the autosaved episode's
+ * `CmsDocument`.
  */
 const measureDecisionCmsStorage25k = (full25kTape: CmsTape) =>
   Effect.runPromise(
@@ -1387,9 +1378,6 @@ const measureDecisionCmsStorage25k = (full25kTape: CmsTape) =>
       const docs = full25kTape.seedDocs.map(toDocumentMeta);
       const plan = seedPlanOf(docs);
       const [hotTargetId, hotReferrers] = [...plan.inbound].reduce((a, b) =>
-        b[1].length > a[1].length ? b : a,
-      );
-      const [hotSegmentId, hotEpisodes] = [...plan.segments].reduce((a, b) =>
         b[1].length > a[1].length ? b : a,
       );
       const editDoc = docs.find((d) => d.id === full25kTape.fixtures.editEpisodeId)!;
@@ -1402,7 +1390,6 @@ const measureDecisionCmsStorage25k = (full25kTape: CmsTape) =>
       yield* Effect.gen(function* () {
         const cmsDocs = yield* CmsDocument;
         const inbound = yield* InboundRefs;
-        const segments = yield* SegmentEpisodes;
         const claims = yield* UniqueClaim;
         yield* cmsDocs.import(editDoc.id, [new CmsDocumentImported({ document: editDoc })], {
           commandId: "seed-doc",
@@ -1412,13 +1399,6 @@ const measureDecisionCmsStorage25k = (full25kTape: CmsTape) =>
           [new InboundRefsImported({ referrerIds: hotReferrers })],
           {
             commandId: "seed-inbound",
-          },
-        );
-        yield* segments.import(
-          hotSegmentId as DocumentId,
-          [new SegmentEpisodesImported({ episodeIds: hotEpisodes })],
-          {
-            commandId: "seed-segment",
           },
         );
         yield* claims.import(
@@ -1437,14 +1417,11 @@ const measureDecisionCmsStorage25k = (full25kTape: CmsTape) =>
         hotTargetId,
         hotTargetKind: docs.find((d) => d.id === hotTargetId)?.kind ?? "unknown",
         hotReferrerCount: hotReferrers.length,
-        hotSegmentMetaBytes: metaOf(hotSegmentId),
-        hotSegmentEpisodeCount: hotEpisodes.length,
         claimMetaBytes: metaOf(claimKey),
         instanceCounts: {
           documents: docs.length,
           claims: plan.claims.size,
           inboundTargets: plan.inbound.size,
-          segmentIndexes: plan.segments.size,
         },
         editInstancesRead: 0,
       };
@@ -1554,15 +1531,8 @@ const runDecisionCmsOnWorkerd = async (
     audioMasterId: n(f.noHighlightMasterId),
     clipOnlyMode: true,
   });
-  const e8a = await postJson("/cms/decision/publish", {
+  const e8 = await postJson("/cms/decision/publish", {
     documentIds: [n(f.draftOnlyMasterId), n("ep-unpub-master")],
-  });
-  const e8b = await postJson<{
-    ok: boolean;
-    receipt?: { reply: { updatedEpisodeIds: Array<string> } };
-  }>("/cms/decision/sync-tags", {
-    segmentId: n(f.primarySegmentId),
-    tagIds: [n(f.secondaryTagId)],
   });
   const checks = [
     e1.status === 409,
@@ -1572,8 +1542,7 @@ const runDecisionCmsOnWorkerd = async (
     e5.status === 409,
     e6.status === 409,
     e7a.status === 409 && e7b.status === 409,
-    e8a.status === 200 &&
-      Boolean(e8b.data.receipt?.reply.updatedEpisodeIds.includes(n(f.editEpisodeId))),
+    e8.status === 200,
   ];
   const invariants: CmsInvariantResults = {
     staleRevisionRejected: checks[0]!,
@@ -1583,13 +1552,13 @@ const runDecisionCmsOnWorkerd = async (
     deleteInUseRejected: checks[4]!,
     unpublishedAudioMasterRejected: checks[5]!,
     clipOnlyRuleRejected: checks[6]!,
-    atomicPublishAndTagCascadeSucceeded: checks[7]!,
+    atomicPublishSucceeded: checks[7]!,
     passedCount: checks.filter(Boolean).length,
   };
   if (invariants.passedCount < 8) {
     console.log(
       "Topology E probe statuses:",
-      [e1, e2, e3, e4, e5, e6, e7a, e7b, e8a, e8b].map((r) => r.status),
+      [e1, e2, e3, e4, e5, e6, e7a, e7b, e8].map((r) => r.status),
     );
   }
 
@@ -1606,7 +1575,6 @@ const runDecisionCmsOnWorkerd = async (
       receipt?: { reply: { revision: number }; commits: ReadonlyArray<unknown> };
     }>("/cms/decision/save", {
       ...edit,
-      tagIds: known.tagIds,
       expectedRevision: known.revision,
       title: `${editMeta.title} (autosave ${e + 1})`,
       bodyHash: `sha256:edit${String(e).padStart(59, "0")}`,
@@ -1709,7 +1677,6 @@ const runDecisionCmsOnWorkerd = async (
   const maxSingleDoMetaAt25kBytes = Math.max(
     storage.docMetaBytes,
     storage.hotInboundMetaBytes,
-    storage.hotSegmentMetaBytes,
     storage.claimMetaBytes,
   );
   const result: CmsBenchmarkResult = {
@@ -1735,7 +1702,7 @@ const runDecisionCmsOnWorkerd = async (
 /**
  * Exact `"meta"` bytes of the heaviest instance of each Topology F aggregate at
  * 25,000 documents: the show with the most episodes (its schedule), the edited
- * episode, its audio master, and the most-tagged segment.
+ * episode, its audio master, and a segment.
  */
 const measureContentStorage25k = (full25kTape: CmsTape) =>
   Effect.runPromise(
@@ -1747,9 +1714,7 @@ const measureContentStorage25k = (full25kTape: CmsTape) =>
       );
       const edit = plan.episodes.find((e) => e.id === full25kTape.fixtures.editEpisodeId)!;
       const master = plan.masters.find((m) => m.id === edit.episode.audioMasterId)!;
-      const segment = plan.items
-        .filter((i) => i.item.kind === "segment")
-        .reduce((a, b) => (b.item.tagIds.length > a.item.tagIds.length ? b : a));
+      const segment = plan.items.find((i) => i.item.kind === "segment")!;
 
       const host = createInstrumentedDoPlatform();
       const layer = ContentDomain.layer(Layer.empty, { legacyData: false }).pipe(
@@ -1815,7 +1780,6 @@ const runContentDomainOnWorkerd = async (
     audioMasterId: editMeta.audioMasterId,
     segmentIds: editMeta.segmentIds,
     hostIds: editMeta.hostIds,
-    tagIds: editMeta.tagIds,
     managedLinkIds: editMeta.managedLinkIds,
     mediaAssetIds: editMeta.mediaAssetIds,
   };
@@ -1874,27 +1838,10 @@ const runContentDomainOnWorkerd = async (
     releaseDate: "2029-12-26",
   });
   const f7b = await postJson<R>("/cms/content/publish", { episodeId: n("ep-clip-no-hl") });
-  // (8a) publish an episode with its audio master in one step
-  const f8a = await postJson("/cms/content/publish", {
+  // (8) publish an episode with its audio master in one step
+  const f8 = await postJson("/cms/content/publish", {
     episodeId: n("ep-unpub-master"),
     publishAudioMaster: true,
-  });
-  // (8b, restated) the episode's tags follow its primary segment when read
-  const seg = await postJson<{ item: { revision: number; kind: string; title: string } }>(
-    "/cms/content/get-item",
-    {
-      itemId: n(f.primarySegmentId),
-    },
-  );
-  await postJson("/cms/content/save-item", {
-    itemId: n(f.primarySegmentId),
-    expectedRevision: seg.data.item.revision,
-    kind: seg.data.item.kind,
-    title: seg.data.item.title,
-    tagIds: [n(f.secondaryTagId)],
-  });
-  const f8b = await postJson<{ tagIds: Array<string> }>("/cms/content/effective-tags", {
-    episodeId: editMeta.id,
   });
   // (5, restated) retiring is always allowed; publishing against retired content is refused
   const f5retire = await postJson("/cms/content/retire-item", { itemId: n(f.referencedAssetId) });
@@ -1910,7 +1857,7 @@ const runContentDomainOnWorkerd = async (
     f6.status === 409,
     f7a.data.error?._tag === "ClipOnlyRuleViolation" &&
       f7b.data.error?._tag === "ClipOnlyRuleViolation",
-    f8a.status === 200 && f8b.data.tagIds.includes(n(f.secondaryTagId)),
+    f8.status === 200,
   ];
   const invariants: CmsInvariantResults = {
     staleRevisionRejected: checks[0]!,
@@ -1920,14 +1867,13 @@ const runContentDomainOnWorkerd = async (
     deleteInUseRejected: checks[4]!,
     unpublishedAudioMasterRejected: checks[5]!,
     clipOnlyRuleRejected: checks[6]!,
-    atomicPublishAndTagCascadeSucceeded: checks[7]!,
+    atomicPublishSucceeded: checks[7]!,
     passedCount: checks.filter(Boolean).length,
   };
   if (invariants.passedCount < 8) {
     console.log(
       "Topology F probe statuses:",
-      [f1, f2, f3, f4edit, f4, f5retire, f5, f6, f7a, f7b, f8a].map((r) => r.status),
-      f8b.data,
+      [f1, f2, f3, f4edit, f4, f5retire, f5, f6, f7a, f7b, f8].map((r) => r.status),
     );
   }
 
@@ -2184,7 +2130,7 @@ const main = async () => {
       { name: "Monolith Workspace DO", res: cms.monolithResult },
       { name: "Naive Split ContentDocument DO", res: cms.splitResult },
       { name: "Topology E: Per-Doc Aggregates + Decision", res: dec.result },
-      { name: "Topology F: Content Domain (4 of 8 restated)", res: con.result },
+      { name: "Topology F: Content Domain (3 of 8 restated)", res: con.result },
     ];
 
     console.log("\n### 2. Podcast Network CMS (25,000 Docs) — Falsifiable Scorecard");
@@ -2207,10 +2153,10 @@ const main = async () => {
     const st = dec.storage;
     console.log("\nTopology E (Decision) at 25,000 docs:");
     console.log(
-      `  - Instances: ${st.instanceCounts.documents.toLocaleString()} CmsDocument, ${st.instanceCounts.claims.toLocaleString()} UniqueClaim, ${st.instanceCounts.inboundTargets.toLocaleString()} InboundRefs, ${st.instanceCounts.segmentIndexes.toLocaleString()} SegmentEpisodes`,
+      `  - Instances: ${st.instanceCounts.documents.toLocaleString()} CmsDocument, ${st.instanceCounts.claims.toLocaleString()} UniqueClaim, ${st.instanceCounts.inboundTargets.toLocaleString()} InboundRefs`,
     );
     console.log(
-      `  - Heaviest InboundRefs (${st.hotTargetKind}, ${st.hotReferrerCount.toLocaleString()} referrers): ${fmtSize(st.hotInboundMetaBytes)}; heaviest SegmentEpisodes (${st.hotSegmentEpisodeCount} episodes): ${fmtSize(st.hotSegmentMetaBytes)}; one claim: ${fmtSize(st.claimMetaBytes)}`,
+      `  - Heaviest InboundRefs (${st.hotTargetKind}, ${st.hotReferrerCount.toLocaleString()} referrers): ${fmtSize(st.hotInboundMetaBytes)}; one claim: ${fmtSize(st.claimMetaBytes)}`,
     );
     console.log(
       `  - Instances one autosave of the edited episode reads (and prepares): ${dec.instancesPerAutosave}`,

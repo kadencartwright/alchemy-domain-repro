@@ -9,25 +9,12 @@ import {
   CmsDocumentImported,
   InboundRefs,
   InboundRefsImported,
-  indexedSegmentOf,
   observedFor,
   referencesOf,
-  SegmentEpisodes,
-  SegmentEpisodesImported,
   UniqueClaim,
 } from "./DecisionCms.aggregates.ts";
-import {
-  DeleteCmsDocument,
-  PublishCmsDocuments,
-  SaveCmsDraft,
-  SyncCmsSegmentTags,
-} from "./DecisionCms.commands.ts";
-import {
-  CmsDocumentDeletion,
-  CmsDraftSaving,
-  CmsPublication,
-  CmsSegmentTagSync,
-} from "./DecisionCms.decisions.ts";
+import { DeleteCmsDocument, PublishCmsDocuments, SaveCmsDraft } from "./DecisionCms.commands.ts";
+import { CmsDocumentDeletion, CmsDraftSaving, CmsPublication } from "./DecisionCms.decisions.ts";
 
 export type Draft = Omit<ConstructorParameters<typeof SaveCmsDraft>[0], "observed" | "_tag">;
 
@@ -38,11 +25,9 @@ export type Draft = Omit<ConstructorParameters<typeof SaveCmsDraft>[0], "observe
  */
 export const DecisionCmsClient = Effect.gen(function* () {
   const docs = yield* CmsDocument;
-  const segIndex = yield* SegmentEpisodes;
   const saving = yield* CmsDraftSaving;
   const deletion = yield* CmsDocumentDeletion;
   const publication = yield* CmsPublication;
-  const tagSync = yield* CmsSegmentTagSync;
 
   /** Save with what the caller already knows of the document (an autosave): no read first. */
   const saveKnown = (
@@ -86,32 +71,8 @@ export const DecisionCmsClient = Effect.gen(function* () {
             observed: {
               ...observed,
               references: [...new Set([...observed.references, ...deps])],
-              indexedSegments: [
-                ...new Set([
-                  ...observed.indexedSegments,
-                  ...states.flatMap((s) =>
-                    s?.kind === "episode" && s.segmentIds[0] ? [s.segmentIds[0]] : [],
-                  ),
-                ]),
-              ],
             },
           }),
-          options,
-        );
-      }),
-    syncTags: (
-      segmentId: DocumentId,
-      tagIds: ReadonlyArray<DocumentId>,
-      options?: { readonly commandId?: string },
-    ) =>
-      Effect.gen(function* () {
-        const index = yield* segIndex.get(segmentId);
-        const episodeIds = Object.keys(index.episodes) as Array<DocumentId>;
-        const states = yield* Effect.forEach([segmentId, ...episodeIds], (id) => docs.get(id), {
-          concurrency: "unbounded",
-        });
-        return yield* tagSync.send(
-          new SyncCmsSegmentTags({ segmentId, tagIds, episodeIds, observed: observedFor(states) }),
           options,
         );
       }),
@@ -123,14 +84,11 @@ export const DecisionCmsClient = Effect.gen(function* () {
 export const seedPlanOf = (documents: ReadonlyArray<DocumentMeta>) => {
   const claims = new Map<string, DocumentId>();
   const inbound = new Map<string, Array<DocumentId>>();
-  const segments = new Map<string, Array<DocumentId>>();
   for (const doc of documents) {
     for (const key of claimKeysOf(doc)) claims.set(key, doc.id);
     for (const ref of referencesOf(doc)) inbound.set(ref, [...(inbound.get(ref) ?? []), doc.id]);
-    const seg = indexedSegmentOf(doc);
-    if (seg !== null) segments.set(seg, [...(segments.get(seg) ?? []), doc.id]);
   }
-  return { documents, claims, inbound, segments };
+  return { documents, claims, inbound };
 };
 
 /**
@@ -141,7 +99,6 @@ export const DecisionCmsSeeder = Effect.gen(function* () {
   const docs = yield* CmsDocument;
   const claimsClient = yield* UniqueClaim;
   const inboundClient = yield* InboundRefs;
-  const segmentsClient = yield* SegmentEpisodes;
   return (documents: ReadonlyArray<DocumentMeta>, options: { readonly concurrency: number }) =>
     Effect.gen(function* () {
       const plan = seedPlanOf(documents);
@@ -170,19 +127,10 @@ export const DecisionCmsSeeder = Effect.gen(function* () {
           }),
         { concurrency, discard: true },
       );
-      yield* Effect.forEach(
-        [...plan.segments],
-        ([id, episodeIds]) =>
-          segmentsClient.import(id as DocumentId, [new SegmentEpisodesImported({ episodeIds })], {
-            commandId: `seed:${id}`,
-          }),
-        { concurrency, discard: true },
-      );
       return {
         documents: plan.documents.length,
         claims: plan.claims.size,
         inboundTargets: plan.inbound.size,
-        segmentIndexes: plan.segments.size,
       };
     });
 });

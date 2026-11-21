@@ -20,26 +20,23 @@ import { DocumentNotFound, RevisionConflict } from "../Workspace/WorkspaceRule.r
  * - `Show` owns its episode schedule (episode slugs and release dates).
  * - `ShowHandle` is a show's public slug, unique per ownership type.
  * - `Episode` owns its draft; editing it is a plain single-aggregate command.
- * - `AudioMaster` and `LibraryItem` (segments, hosts, tags, links, media,
+ * - `AudioMaster` and `LibraryItem` (segments, hosts, links, media,
  *   channel welcomes) are content an episode uses.
  *
  * Three rules are restated as content rules rather than kept as reference
  * integrity (see the README): content is retired, never hard-deleted, and an
- * episode may not publish against missing or retired content; reference and
- * `clipOnlyMode` checks run when an episode publishes, not on every edit; and
- * an episode's tags come from its primary segment when it's read, rather than
- * being written to every episode when the segment changes.
+ * episode may not publish against missing or retired content; and reference
+ * and `clipOnlyMode` checks run when an episode publishes, not on every edit.
  */
 
 const at = (now: DateTime.Utc) => DateTime.toEpochMillis(now);
 const ids = Schema.Array(DocumentId);
 
-// --- LibraryItem: segments, hosts, tags, managed links, media, channel welcomes ---
+// --- LibraryItem: segments, hosts, managed links, media, channel welcomes ---
 
 export const LibraryKind = Schema.Literals([
   "segment",
   "host",
-  "taxonomyTag",
   "managedLink",
   "mediaAsset",
   "channelWelcome",
@@ -49,8 +46,6 @@ export type LibraryKind = typeof LibraryKind.Type;
 export const LibraryItemRecord = Schema.Struct({
   kind: LibraryKind,
   title: Schema.String,
-  /** For a segment: the tags every episode using it as primary segment carries. */
-  tagIds: ids,
   retired: Schema.Boolean,
   revision: Revision,
 });
@@ -60,7 +55,6 @@ export type LibraryItemState = typeof LibraryItemState.Type;
 export class LibraryItemSaved extends Domain.Event("LibraryItemSaved", {
   kind: LibraryKind,
   title: Schema.String,
-  tagIds: ids,
   revision: Revision,
 }) {}
 export class LibraryItemRetired extends Domain.Event("LibraryItemRetired", {
@@ -76,7 +70,6 @@ export class SaveLibraryItem extends Domain.Command("SaveLibraryItem", {
     expectedRevision: Schema.NullOr(Revision),
     kind: LibraryKind,
     title: Schema.String,
-    tagIds: ids,
   },
   events: [LibraryItemSaved],
   rejects: [RevisionConflict],
@@ -111,7 +104,6 @@ export class LibraryItem extends Domain.Aggregate("LibraryItem", {
         new LibraryItemSaved({
           kind: cmd.kind,
           title: cmd.title,
-          tagIds: cmd.tagIds,
           revision: (actual ?? 0) + 1,
         }),
       ];
@@ -127,7 +119,6 @@ export class LibraryItem extends Domain.Aggregate("LibraryItem", {
     LibraryItemSaved: (s, e) => ({
       kind: e.kind,
       title: e.title,
-      tagIds: e.tagIds,
       retired: s?.retired ?? false,
       revision: e.revision,
     }),
@@ -377,7 +368,6 @@ export const EpisodeContentFields = {
   audioMasterId: Schema.NullOr(DocumentId),
   segmentIds: ids,
   hostIds: ids,
-  tagIds: ids,
   managedLinkIds: ids,
   mediaAssetIds: ids,
 };
@@ -466,18 +456,7 @@ export class Episode extends Domain.Aggregate("Episode", {
   reply: { EditEpisodeDraft: (s) => ({ revision: s?.revision ?? 0 }) },
 }) {}
 
-/** The tags an episode carries: its primary segment's when it has one, read at the time. */
-export const effectiveTagsOf = (
-  episode: EpisodeState,
-  primarySegment: LibraryItemState,
-): ReadonlyArray<DocumentId> =>
-  episode === null
-    ? []
-    : primarySegment !== null && episode.segmentIds[0]
-      ? primarySegment.tagIds
-      : episode.tagIds;
-
 /** Every library item an episode uses. */
 export const libraryRefsOf = (e: NonNullable<EpisodeState>): Array<DocumentId> => [
-  ...new Set([...e.segmentIds, ...e.hostIds, ...e.tagIds, ...e.managedLinkIds, ...e.mediaAssetIds]),
+  ...new Set([...e.segmentIds, ...e.hostIds, ...e.managedLinkIds, ...e.mediaAssetIds]),
 ];

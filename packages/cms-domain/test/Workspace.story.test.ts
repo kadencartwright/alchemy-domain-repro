@@ -24,8 +24,6 @@ import {
   DraftSaved,
   PublishWorkspace,
   SaveDraft,
-  SegmentTagsCascaded,
-  SyncSegmentTags,
   WorkspacePublished,
 } from "../src/Workspace/Workspace.commands.ts";
 import { WorkspaceCms, WorkspaceCmsHandlers } from "../src/Workspace/Workspace.model.ts";
@@ -64,7 +62,6 @@ const baseDraft = (
   chapters: [],
   segmentIds: [],
   hostIds: [],
-  tagIds: [],
   managedLinkIds: [],
   mediaAssetIds: [],
   bodyHash: "sha256:default",
@@ -75,11 +72,9 @@ const baseDraft = (
 });
 
 it.effect(
-  "Monolith Workspace enforces all 8 Podcast Network invariants (slugs, refs, publish readiness, clipOnlyMode, tag cascade)",
+  "Monolith Workspace enforces all 8 Podcast Network invariants (slugs, refs, publish readiness, clipOnlyMode, atomic publish)",
   () => {
     const ws = Workspace.ref(WorkspaceId.make("ws-podcast"));
-    const tag1 = DocumentId.make("tag-tech");
-    const tag2 = DocumentId.make("tag-ai");
     const seg1 = DocumentId.make("seg-theme");
     const showInternal = DocumentId.make("show-internal");
     const showPartner = DocumentId.make("show-partner");
@@ -90,31 +85,9 @@ it.effect(
 
     return workspaceStory(
       Story.clock("2026-11-20T12:00:00Z"),
-      // Seed tags & segment
+      // Seed a segment
       Story.when(
-        new SaveDraft(baseDraft({ documentId: tag1, title: "Tech", kind: "taxonomyTag" })),
-      ),
-      Story.then(
-        ws,
-        new DraftSaved({
-          ...baseDraft({ documentId: tag1, title: "Tech", kind: "taxonomyTag" }),
-          revision: 1,
-          savedAt: T0,
-        }),
-      ),
-      Story.when(new SaveDraft(baseDraft({ documentId: tag2, title: "AI", kind: "taxonomyTag" }))),
-      Story.then(
-        ws,
-        new DraftSaved({
-          ...baseDraft({ documentId: tag2, title: "AI", kind: "taxonomyTag" }),
-          revision: 1,
-          savedAt: T0,
-        }),
-      ),
-      Story.when(
-        new SaveDraft(
-          baseDraft({ documentId: seg1, title: "Opening Theme", kind: "segment", tagIds: [tag1] }),
-        ),
+        new SaveDraft(baseDraft({ documentId: seg1, title: "Opening Theme", kind: "segment" })),
       ),
       Story.then(
         ws,
@@ -123,7 +96,6 @@ it.effect(
             documentId: seg1,
             title: "Opening Theme",
             kind: "segment",
-            tagIds: [tag1],
           }),
           revision: 1,
           savedAt: T0,
@@ -293,7 +265,6 @@ it.effect(
             audioMasterId: masterValid,
             clipOnlyMode: true,
             segmentIds: [seg1],
-            tagIds: [tag1],
           }),
         ),
       ),
@@ -310,7 +281,6 @@ it.effect(
             audioMasterId: masterValid,
             clipOnlyMode: true,
             segmentIds: [seg1],
-            tagIds: [tag1],
           }),
           revision: 1,
           savedAt: T0,
@@ -366,20 +336,6 @@ it.effect(
         new WorkspacePublished({ documentIds: [showPartner, masterValid, ep1], publishedAt: T0 }),
       ),
       Story.replied({ publishedCount: 3 }),
-      // Cascading segment tag sync propagates tag2 to published ep1
-      Story.when(
-        new SyncSegmentTags({ workspaceId: ws.id, segmentId: seg1, tagIds: [tag1, tag2] }),
-      ),
-      Story.then(
-        ws,
-        new SegmentTagsCascaded({
-          segmentId: seg1,
-          tagIds: [tag1, tag2],
-          updatedEpisodeIds: [ep1],
-          syncedAt: T0,
-        }),
-      ),
-      Story.state(ws, (s) => s.documents[ep1]?.tagIds.includes(tag2) === true),
       Story.query(
         SearchCatalog,
         { workspaceId: WorkspaceId.make("ws-podcast"), query: "Episode 1", publishedOnly: true },
@@ -399,7 +355,6 @@ it.effect(
             audioMasterId: masterValid,
             clipOnlyMode: true,
             segmentIds: [seg1],
-            tagIds: [tag1, tag2],
           }),
         ),
       ),
@@ -416,7 +371,6 @@ it.effect(
             audioMasterId: masterValid,
             clipOnlyMode: true,
             segmentIds: [seg1],
-            tagIds: [tag1, tag2],
           }),
           revision: 2,
           savedAt: T0,

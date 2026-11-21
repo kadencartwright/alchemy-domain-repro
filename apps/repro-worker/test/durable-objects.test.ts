@@ -46,7 +46,6 @@ const podcastDraft = (overrides: {
   chapters: [],
   segmentIds: [],
   hostIds: [],
-  tagIds: [],
   managedLinkIds: [],
   mediaAssetIds: [],
   bodyHash: overrides.bodyHash,

@@ -47,7 +47,7 @@ describe("Falsifiable synthetic benchmarks & mocked reference baselines", () => 
     expect(res.invariants.deleteInUseRejected).toBe(true);
     expect(res.invariants.unpublishedAudioMasterRejected).toBe(true);
     expect(res.invariants.clipOnlyRuleRejected).toBe(true);
-    expect(res.invariants.atomicPublishAndTagCascadeSucceeded).toBe(true);
+    expect(res.invariants.atomicPublishSucceeded).toBe(true);
     expect(res.invariants.passedCount).toBe(8);
     expect(res.gates.allPassed).toBe(true);
   });

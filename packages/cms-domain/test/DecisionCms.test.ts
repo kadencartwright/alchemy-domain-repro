@@ -6,7 +6,6 @@ import {
   CmsDocument,
   InboundRefs,
   observedFor,
-  SegmentEpisodes,
   UniqueClaim,
   ClaimKey,
 } from "../src/Decision/DecisionCms.aggregates.ts";
@@ -15,13 +14,11 @@ import {
   noneObserved,
   PublishCmsDocuments,
   SaveCmsDraft,
-  SyncCmsSegmentTags,
 } from "../src/Decision/DecisionCms.commands.ts";
 import {
   CmsDocumentDeletion,
   CmsDraftSaving,
   CmsPublication,
-  CmsSegmentTagSync,
 } from "../src/Decision/DecisionCms.decisions.ts";
 import { DecisionCms } from "../src/Decision/DecisionCms.model.ts";
 import { type Draft, DecisionCmsClient } from "../src/Decision/DecisionCms.client.ts";
@@ -43,7 +40,6 @@ const draft = (o: Partial<Draft> & Pick<Draft, "documentId" | "title" | "kind">)
   chapters: [],
   segmentIds: [],
   hostIds: [],
-  tagIds: [],
   managedLinkIds: [],
   mediaAssetIds: [],
   bodyHash: "sha256:default",
@@ -56,8 +52,6 @@ const draft = (o: Partial<Draft> & Pick<Draft, "documentId" | "title" | "kind">)
 const client = DecisionCmsClient;
 
 const id = DocumentId.make;
-const tag1 = id("tag-tech");
-const tag2 = id("tag-ai");
 const seg1 = id("seg-opening");
 const showInternal = id("show-internal");
 const showPartner = id("show-partner");
@@ -74,18 +68,13 @@ describe("Topology E: per-document aggregates + Domain.Decision", () => {
       const cms = yield* client;
       const tagOf = (e: { readonly _tag: string }) => e._tag;
 
-      yield* cms.save(draft({ documentId: tag1, title: "Tech", kind: "taxonomyTag" }));
-      yield* cms.save(draft({ documentId: tag2, title: "AI", kind: "taxonomyTag" }));
-      yield* cms.save(
-        draft({ documentId: seg1, title: "Opening", kind: "segment", tagIds: [tag1] }),
-      );
+      yield* cms.save(draft({ documentId: seg1, title: "Opening", kind: "segment" }));
       // An autosave that keeps its references and claims reads only its own document.
       const autosave = yield* cms.save(
         draft({
           documentId: seg1,
           title: "Opening (edited)",
           kind: "segment",
-          tagIds: [tag1],
           expectedRevision: 1,
         }),
       );
@@ -142,7 +131,6 @@ describe("Topology E: per-document aggregates + Domain.Decision", () => {
         audioMasterId: masterValid,
         clipOnlyMode: true,
         segmentIds: [seg1],
-        tagIds: [tag1],
       });
       yield* cms.save(episode);
 
@@ -215,18 +203,11 @@ describe("Topology E: per-document aggregates + Domain.Decision", () => {
         referencedBy: [ep1],
       });
 
-      // (8a) atomic multi-document publish
+      // (8) atomic multi-document publish
       const published = yield* cms.publish([masterValid, ep1]);
       expect(published.commits.length).toBeGreaterThan(2);
       expect((yield* cms.get(ep1))?.publishedRevision).toBe(1);
       expect((yield* cms.get(masterValid))?.publishedRevision).toBe(1);
-
-      // (8b) the segment's tags cascade to its published episodes, atomically
-      const synced = yield* cms.syncTags(seg1, [tag1, tag2]);
-      expect(synced.reply.updatedEpisodeIds).toEqual([ep1]);
-      expect((yield* cms.get(ep1))?.tagIds).toEqual([tag1, tag2]);
-      const inboundTag2 = yield* (yield* InboundRefs).get(tag2);
-      expect(Object.keys(inboundTag2.referrers).sort()).toEqual([ep1, seg1].sort());
 
       // A freed claim can be taken by someone else.
       yield* cms.remove(showInternal, 1);

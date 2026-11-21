@@ -14,9 +14,9 @@ export const Revision = Schema.Int;
 export type Revision = typeof Revision.Type;
 
 /**
- * 9 core document types modeling a ~25,000-document Podcast Network CMS
+ * 8 core document types modeling a ~25,000-document Podcast Network CMS
  * (shows, episodes, audio masters with timed chapters, reusable musical/topic
- * segments, hosts/guests, hierarchical taxonomy tags, managed CTA links,
+ * segments, hosts/guests, managed CTA links,
  * media assets, and system-managed per-show welcome audio projections).
  */
 export const PodcastDocKind = Schema.Literals([
@@ -25,7 +25,6 @@ export const PodcastDocKind = Schema.Literals([
   "audioMaster",
   "segment",
   "host",
-  "taxonomyTag",
   "managedLink",
   "mediaAsset",
   "channelWelcome",

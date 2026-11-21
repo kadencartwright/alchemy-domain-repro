@@ -15,8 +15,6 @@ import { DocumentId } from "../src/Ids.ts";
 const World = ContentDomain.layer(Layer.empty).pipe(Layer.provide(Domain.InMemory));
 const id = DocumentId.make;
 
-const tag1 = id("tag-tech");
-const tag2 = id("tag-ai");
 const seg1 = id("seg-opening");
 const host = id("host-1");
 const internal = id("show-internal");
@@ -38,7 +36,6 @@ const episode = (o: Partial<EpisodeEdit> & Pick<EpisodeEdit, "episodeId">): Epis
   audioMasterId: master,
   segmentIds: [seg1],
   hostIds: [host],
-  tagIds: [],
   managedLinkIds: [],
   mediaAssetIds: [],
   ...o,
@@ -46,20 +43,12 @@ const episode = (o: Partial<EpisodeEdit> & Pick<EpisodeEdit, "episodeId">): Epis
 
 const setUp = Effect.gen(function* () {
   const c = yield* ContentClient;
-  for (const [itemId, kind, tagIds] of [
-    [tag1, "taxonomyTag", []],
-    [tag2, "taxonomyTag", []],
-    [seg1, "segment", [tag1]],
-    [host, "host", []],
+  for (const [itemId, kind] of [
+    [seg1, "segment"],
+    [host, "host"],
   ] as const) {
     yield* c.library.send(
-      new SaveLibraryItem({
-        itemId,
-        expectedRevision: null,
-        kind,
-        title: itemId,
-        tagIds: [...tagIds],
-      }),
+      new SaveLibraryItem({ itemId, expectedRevision: null, kind, title: itemId }),
     );
   }
   yield* c.saveShow({
@@ -103,7 +92,7 @@ const setUp = Effect.gen(function* () {
 });
 
 describe("Topology F: the content domain", () => {
-  it.effect("keeps invariants 1, 2, 3, 6 and 8a as they are", () =>
+  it.effect("keeps invariants 1, 2, 3, 6 and 8 as they are", () =>
     Effect.gen(function* () {
       const c = yield* setUp;
       // (1) stale revision on an autosave, a plain single-aggregate command
@@ -144,14 +133,14 @@ describe("Topology F: the content domain", () => {
         _tag: "PublishReadinessViolation",
         reason: "audio_master_unpublished",
       });
-      // (8a) publishing it together with its audio master is one atomic step
+      // (8) publishing it together with its audio master is one atomic step
       const both = yield* c.publish(id("ep-3"), true);
       expect(both.commits.map((x) => x.stream)).toContain(`AudioMaster/${draftMaster}`);
       expect((yield* c.masters.get(draftMaster))?.published).toBe(true);
     }).pipe(Effect.provide(World)),
   );
 
-  it.effect("restates invariants 4, 5, 7 and 8b as content rules", () =>
+  it.effect("restates invariants 4, 5 and 7 as content rules", () =>
     Effect.gen(function* () {
       const c = yield* setUp;
       // (4) a missing reference is allowed while drafting, refused at publish
@@ -178,19 +167,6 @@ describe("Topology F: the content domain", () => {
       });
       // ...and a partner show with one valid highlight publishes
       yield* c.publish(ep1);
-      // (8b) an episode's tags follow its primary segment when read
-      expect(yield* c.effectiveTags(ep1)).toEqual([tag1]);
-      const seg = (yield* c.library.get(seg1))!;
-      yield* c.library.send(
-        new SaveLibraryItem({
-          itemId: seg1,
-          expectedRevision: seg.revision,
-          kind: "segment",
-          title: "Opening",
-          tagIds: [tag1, tag2],
-        }),
-      );
-      expect(yield* c.effectiveTags(ep1)).toEqual([tag1, tag2]);
     }).pipe(Effect.provide(World)),
   );
 });

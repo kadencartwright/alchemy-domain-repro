@@ -19,7 +19,6 @@ export class WorkspaceCmsApi extends Domain.Api("WorkspaceCmsApi", {
     "BulkImportDocuments",
     "DeleteDocument",
     "PublishWorkspace",
-    "SyncSegmentTags",
     "DiscardDraft",
   ],
   queries: ["SearchCatalog"],

@@ -39,12 +39,10 @@ export const DocumentMeta = Schema.Struct({
   durationSeconds: Schema.NullOr(Schema.Number),
   /** For `audioMaster`: timed chapter sections with loudness metadata. */
   chapters: Schema.Array(AudioChapterSection),
-  /** Reusable musical/editorial segments (`segmentIds[0]` drives cascading tag sync on episodes). */
+  /** Reusable musical/editorial segments. */
   segmentIds: Schema.Array(DocumentId),
   /** Host / guest / producer references. */
   hostIds: Schema.Array(DocumentId),
-  /** Hierarchical taxonomy tag references (synced from primary segment when linked). */
-  tagIds: Schema.Array(DocumentId),
   /** Managed CTA / sponsor / show-note external links. */
   managedLinkIds: Schema.Array(DocumentId),
   /** Media asset references (cover art, ambient beds, intro/outro bumpers, PDF notes). */
@@ -72,7 +70,6 @@ export const allStrongRefsOf = (doc: {
   readonly audioMasterId: DocumentId | null;
   readonly segmentIds: ReadonlyArray<DocumentId>;
   readonly hostIds: ReadonlyArray<DocumentId>;
-  readonly tagIds: ReadonlyArray<DocumentId>;
   readonly managedLinkIds: ReadonlyArray<DocumentId>;
   readonly mediaAssetIds: ReadonlyArray<DocumentId>;
   readonly strongRefs: ReadonlyArray<DocumentId>;
@@ -82,7 +79,6 @@ export const allStrongRefsOf = (doc: {
   if (doc.audioMasterId !== null) out.add(doc.audioMasterId);
   for (const id of doc.segmentIds) out.add(id);
   for (const id of doc.hostIds) out.add(id);
-  for (const id of doc.tagIds) out.add(id);
   for (const id of doc.managedLinkIds) out.add(id);
   for (const id of doc.mediaAssetIds) out.add(id);
   for (const id of doc.strongRefs) out.add(id);

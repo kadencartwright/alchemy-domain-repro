@@ -435,7 +435,7 @@ export interface CmsInvariantResults {
   readonly deleteInUseRejected: boolean;
   readonly unpublishedAudioMasterRejected: boolean;
   readonly clipOnlyRuleRejected: boolean;
-  readonly atomicPublishAndTagCascadeSucceeded: boolean;
+  readonly atomicPublishSucceeded: boolean;
   readonly passedCount: number;
 }
 
@@ -483,7 +483,6 @@ const allRefsOfSynthetic = (doc: SyntheticPodcastDoc): Array<string> => {
   if (doc.audioMasterId) set.add(doc.audioMasterId);
   for (const id of doc.segmentIds) set.add(id);
   for (const id of doc.hostIds) set.add(id);
-  for (const id of doc.tagIds) set.add(id);
   for (const id of doc.managedLinkIds) set.add(id);
   for (const id of doc.mediaAssetIds) set.add(id);
   for (const id of doc.strongRefs) set.add(id);
@@ -501,7 +500,6 @@ export class MockCmsReference {
   private readonly episodeSlugIndex = new Map<string, string>();
   private readonly showDateIndex = new Map<string, string>();
   private readonly reverseRefs = new Map<string, Set<string>>();
-  private readonly episodesByPrimarySegment = new Map<string, Set<string>>();
 
   private indexDoc(doc: MockPodcastRecord): void {
     if (doc.kind === "show" && doc.slug && doc.ownershipType) {
@@ -511,14 +509,6 @@ export class MockCmsReference {
       for (const sh of doc.showIds) {
         if (doc.slug) this.episodeSlugIndex.set(`${sh}:${doc.slug}`, doc.documentId);
         if (doc.releaseDate) this.showDateIndex.set(`${sh}:${doc.releaseDate}`, doc.documentId);
-      }
-      if (doc.segmentIds[0]) {
-        let set = this.episodesByPrimarySegment.get(doc.segmentIds[0]);
-        if (!set) {
-          set = new Set();
-          this.episodesByPrimarySegment.set(doc.segmentIds[0], set);
-        }
-        set.add(doc.documentId);
       }
     }
     for (const target of allRefsOfSynthetic(doc)) {
@@ -544,9 +534,6 @@ export class MockCmsReference {
         if (doc.releaseDate && this.showDateIndex.get(`${sh}:${doc.releaseDate}`) === doc.documentId) {
           this.showDateIndex.delete(`${sh}:${doc.releaseDate}`);
         }
-      }
-      if (doc.segmentIds[0]) {
-        this.episodesByPrimarySegment.get(doc.segmentIds[0])?.delete(doc.documentId);
       }
     }
     for (const target of allRefsOfSynthetic(doc)) {
@@ -638,21 +625,6 @@ export class MockCmsReference {
     return { ok: true };
   }
 
-  syncSegmentTags(segmentId: string, tagIds: ReadonlyArray<string>): ReadonlyArray<string> {
-    const seg = this.docs.get(segmentId);
-    if (!seg) return [];
-    this.docs.set(segmentId, { ...seg, tagIds });
-    const updated: Array<string> = [];
-    for (const epId of this.episodesByPrimarySegment.get(segmentId) ?? []) {
-      const ep = this.docs.get(epId);
-      if (ep?.published) {
-        this.docs.set(epId, { ...ep, tagIds });
-        updated.push(epId);
-      }
-    }
-    return updated;
-  }
-
   getDoc(documentId: string): MockPodcastRecord | undefined {
     return this.docs.get(documentId);
   }
@@ -680,7 +652,6 @@ export const runMockCmsBenchmarks = (tape: CmsTape): CmsBenchmarkResult => {
       clipOnlyMode: false,
       segmentIds: [],
       hostIds: [],
-      tagIds: [],
       managedLinkIds: [],
       mediaAssetIds: [],
       strongRefs: [],
@@ -751,10 +722,8 @@ export const runMockCmsBenchmarks = (tape: CmsTape): CmsBenchmarkResult => {
     },
     null,
   );
-  // 8. Atomic multi-doc publish + cascading segment tag sync
-  const r8a = cms.publishBatch([f.draftOnlyMasterId, "ep-unpublished-master"]);
-  const cascaded = cms.syncSegmentTags(f.primarySegmentId, [f.secondaryTagId]);
-  const r8Ok = r8a.ok && cascaded.includes(f.editEpisodeId);
+  // 8. Atomic multi-doc publish
+  const r8Ok = cms.publishBatch([f.draftOnlyMasterId, "ep-unpublished-master"]).ok;
 
   const checks = [
     !r1.ok && r1.code === "RevisionConflict",
@@ -774,7 +743,7 @@ export const runMockCmsBenchmarks = (tape: CmsTape): CmsBenchmarkResult => {
     deleteInUseRejected: checks[4]!,
     unpublishedAudioMasterRejected: checks[5]!,
     clipOnlyRuleRejected: checks[6]!,
-    atomicPublishAndTagCascadeSucceeded: checks[7]!,
+    atomicPublishSucceeded: checks[7]!,
     passedCount: checks.filter(Boolean).length,
   };
 

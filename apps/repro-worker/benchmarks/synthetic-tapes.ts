@@ -241,7 +241,6 @@ export interface SyntheticPodcastDoc {
   readonly chapters: ReadonlyArray<AudioChapterSection>;
   readonly segmentIds: ReadonlyArray<string>;
   readonly hostIds: ReadonlyArray<string>;
-  readonly tagIds: ReadonlyArray<string>;
   readonly managedLinkIds: ReadonlyArray<string>;
   readonly mediaAssetIds: ReadonlyArray<string>;
   readonly bodyHash: string;
@@ -253,7 +252,6 @@ export interface PodcastCmsCorpusCounts {
   readonly shows: number;
   readonly channelWelcomes: number;
   readonly hosts: number;
-  readonly taxonomyTags: number;
   readonly managedLinks: number;
   readonly mediaAssets: number;
   readonly segments: number;
@@ -280,8 +278,6 @@ export interface CmsTape {
     readonly publishedValidMasterId: string;
     readonly draftOnlyMasterId: string;
     readonly noHighlightMasterId: string;
-    readonly primarySegmentId: string;
-    readonly secondaryTagId: string;
     readonly referencedAssetId: string;
     readonly missingRefId: string;
   };
@@ -291,7 +287,7 @@ export interface CmsTape {
 export const SQLITE_DO_SINGLE_VALUE_LIMIT_BYTES = 2 * 1024 * 1024; // 2 MiB Cloudflare SQLite DO cap
 
 export const CMS_GATES = {
-  /** All 8 cross-document, publish-readiness, multi-hop, and cascade invariants must pass. */
+  /** All 8 cross-document, publish-readiness, multi-hop and atomic-publish invariants must pass. */
   requiredInvariantsPassed: 8,
   /** Single-field editorial autosave p95 on real local workerd DOs. */
   editP95MaxMs: 30,
@@ -307,15 +303,14 @@ export const CMS_GATES = {
 
 /**
  * Generates a realistic, deterministic Podcast Network CMS corpus of `totalDocs`
- * documents across all 9 document types (default: 25,000 documents with ~55,000+
+ * documents across all 8 document types (default: 25,000 documents with ~67,000
  * directed reference edges, matching a production media CMS).
  *
  * Proportions (exact at 25,000 docs):
  * - shows: 350 (1.4%)            - channelWelcomes: 350 (1.4%)
- * - hosts: 1,200 (4.8%)          - taxonomyTags: 800 (3.2%)
- * - managedLinks: 1,800 (7.2%)   - mediaAssets: 3,500 (14.0%)
- * - segments: 4,500 (18.0%)      - audioMasters: 5,000 (20.0%)
- * - episodes: 7,500 (30.0%)
+ * - hosts: 1,200 (4.8%)          - managedLinks: 1,800 (7.2%)
+ * - mediaAssets: 3,500 (14.0%)   - segments: 4,500 (18.0%)
+ * - audioMasters: 5,000 (20.0%)  - episodes: 8,300 (33.2%)
  */
 export const generateCmsTape = (
   totalDocs = 25_000,
@@ -327,7 +322,6 @@ export const generateCmsTape = (
   const shows = Math.max(4, Math.round(350 * scale));
   const channelWelcomes = shows;
   const hosts = Math.max(6, Math.round(1_200 * scale));
-  const taxonomyTags = Math.max(6, Math.round(800 * scale));
   const managedLinks = Math.max(6, Math.round(1_800 * scale));
   const mediaAssets = Math.max(10, Math.round(3_500 * scale));
   const segments = Math.max(10, Math.round(4_500 * scale));
@@ -338,7 +332,6 @@ export const generateCmsTape = (
       (shows +
         channelWelcomes +
         hosts +
-        taxonomyTags +
         managedLinks +
         mediaAssets +
         segments +
@@ -350,34 +343,7 @@ export const generateCmsTape = (
 
   const pad = (n: number) => String(n).padStart(5, "0");
 
-  // 1. Taxonomy tags (hierarchical topics, formats, moods)
-  for (let i = 0; i < taxonomyTags; i++) {
-    seedDocs.push({
-      documentId: `tag-${pad(i)}`,
-      kind: "taxonomyTag",
-      title: `Taxonomy Concept #${i}`,
-      slug: null,
-      ownershipType: null,
-      showIds: [],
-      releaseDate: null,
-      audioMasterId: null,
-      clipOnlyMode: false,
-      closerKind: "none",
-      playableAudio: false,
-      durationSeconds: null,
-      chapters: [],
-      segmentIds: [],
-      hostIds: [],
-      tagIds: [],
-      managedLinkIds: [],
-      mediaAssetIds: [],
-      bodyHash: `sha256:tag${pad(i)}`,
-      strongRefs: [],
-      published: true,
-    });
-  }
-
-  // 2. Hosts / guests / producers
+  // 1. Hosts / guests / producers
   for (let i = 0; i < hosts; i++) {
     seedDocs.push({
       documentId: `host-${pad(i)}`,
@@ -395,7 +361,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: [],
       hostIds: [],
-      tagIds: [],
       managedLinkIds: [],
       mediaAssetIds: [],
       bodyHash: `sha256:host${pad(i)}`,
@@ -404,7 +369,7 @@ export const generateCmsTape = (
     });
   }
 
-  // 3. Managed external CTA / resource links
+  // 2. Managed external CTA / resource links
   for (let i = 0; i < managedLinks; i++) {
     seedDocs.push({
       documentId: `link-${pad(i)}`,
@@ -422,7 +387,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: [],
       hostIds: [],
-      tagIds: [],
       managedLinkIds: [],
       mediaAssetIds: [],
       bodyHash: `sha256:link${pad(i)}`,
@@ -431,7 +395,7 @@ export const generateCmsTape = (
     });
   }
 
-  // 4. Media assets (cover art, ambient beds, intro/outro bumpers, show-note PDFs)
+  // 3. Media assets (cover art, ambient beds, intro/outro bumpers, show-note PDFs)
   for (let i = 0; i < mediaAssets; i++) {
     seedDocs.push({
       documentId: `asset-${pad(i)}`,
@@ -449,7 +413,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: [],
       hostIds: [],
-      tagIds: [],
       managedLinkIds: [],
       mediaAssetIds: [],
       bodyHash: `sha256:asset${pad(i)}`,
@@ -458,12 +421,8 @@ export const generateCmsTape = (
     });
   }
 
-  // 5. Reusable musical/editorial segments (with taxonomy tags that cascade to episodes)
+  // 4. Reusable musical/editorial segments
   for (let i = 0; i < segments; i++) {
-    const t0 = `tag-${pad(i % taxonomyTags)}`;
-    const t1 = `tag-${pad((i * 7 + 3) % taxonomyTags)}`;
-    const tagIds = t0 === t1 ? [t0] : [t0, t1];
-    totalRefEdges += tagIds.length;
     seedDocs.push({
       documentId: `seg-${pad(i)}`,
       kind: "segment",
@@ -480,7 +439,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: [],
       hostIds: [],
-      tagIds,
       managedLinkIds: [],
       mediaAssetIds: [],
       bodyHash: `sha256:seg${pad(i)}`,
@@ -489,7 +447,7 @@ export const generateCmsTape = (
     });
   }
 
-  // 6. Shows (~63% internal, ~37% partner; show-00000 is internal, show-00001 is partner)
+  // 5. Shows (~63% internal, ~37% partner; show-00000 is internal, show-00001 is partner)
   for (let i = 0; i < shows; i++) {
     const ownershipType: OwnershipType = i === 0 ? "internal" : i === 1 ? "partner" : i % 3 === 0 ? "partner" : "internal";
     const hostId = `host-${pad(i % hosts)}`;
@@ -512,7 +470,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: [],
       hostIds: [hostId],
-      tagIds: [],
       managedLinkIds: [linkId],
       mediaAssetIds: [assetId],
       bodyHash: `sha256:show${pad(i)}`,
@@ -521,7 +478,7 @@ export const generateCmsTape = (
     });
   }
 
-  // 7. System-managed Channel Welcome docs (1 per show)
+  // 6. System-managed Channel Welcome docs (1 per show)
   for (let i = 0; i < channelWelcomes; i++) {
     const showId = `show-${pad(i)}`;
     const bedAsset = `asset-${pad((i + 1) % mediaAssets)}`;
@@ -542,7 +499,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: [],
       hostIds: [],
-      tagIds: [],
       managedLinkIds: [],
       mediaAssetIds: [bedAsset],
       bodyHash: `sha256:welcome${pad(i)}`,
@@ -551,7 +507,7 @@ export const generateCmsTape = (
     });
   }
 
-  // 8. Audio Masters (with timed chapters + loudness LUFS)
+  // 7. Audio Masters (with timed chapters + loudness LUFS)
   // Guaranteed fixtures:
   // - master-00000: published + playable + 1 valid highlight chapter
   // - master-00001: DRAFT ONLY (unpublished) + playable + 1 valid highlight chapter
@@ -590,7 +546,6 @@ export const generateCmsTape = (
       chapters,
       segmentIds: [segId],
       hostIds: [hostId],
-      tagIds: [],
       managedLinkIds: [],
       mediaAssetIds: [],
       bodyHash: `sha256:transcript${pad(i)}`,
@@ -599,7 +554,7 @@ export const generateCmsTape = (
     });
   }
 
-  // 9. Episodes (rich multi-edge references across shows, masters, segments, hosts, tags, links, assets)
+  // 8. Episodes (rich multi-edge references across shows, masters, segments, hosts, links, assets)
   const showEpisodeCounter = new Map<number, number>();
   const closers: ReadonlyArray<EpisodeCloserKind> = ["none", "sharePrompt", "bonusClip", "outroVideo"];
   for (let i = 0; i < episodes; i++) {
@@ -619,10 +574,10 @@ export const generateCmsTape = (
 
     const masterIdx = i === 0 ? 0 : (i % (audioMasters - 3)) + 3; // avoid draft-only master-00001
     const masterDoc = seedDocs[
-      taxonomyTags + hosts + managedLinks + mediaAssets + segments + shows + channelWelcomes + masterIdx
+      hosts + managedLinks + mediaAssets + segments + shows + channelWelcomes + masterIdx
     ]!;
     const primaryShowDoc =
-      seedDocs[taxonomyTags + hosts + managedLinks + mediaAssets + segments + primaryShowIdx]!;
+      seedDocs[hosts + managedLinks + mediaAssets + segments + primaryShowIdx]!;
 
     const canClipOnly =
       primaryShowDoc.ownershipType === "partner" &&
@@ -633,7 +588,6 @@ export const generateCmsTape = (
     const seg1 = `seg-${pad((i * 3 + 1) % segments)}`;
     const epSegments = seg0 === seg1 ? [seg0] : [seg0, seg1];
     const epHosts = [`host-${pad(i % hosts)}`];
-    const epTags = [`tag-${pad(i % taxonomyTags)}`, `tag-${pad((i * 5 + 1) % taxonomyTags)}`];
     const epAssets = [i === 0 ? "asset-00000" : `asset-${pad(i % mediaAssets)}`];
     const epLinks = i % 2 === 0 ? [`link-${pad(i % managedLinks)}`] : [];
 
@@ -642,7 +596,7 @@ export const generateCmsTape = (
       .slice(0, 10);
 
     totalRefEdges +=
-      showIds.length + 1 + epSegments.length + epHosts.length + epTags.length + epAssets.length + epLinks.length;
+      showIds.length + 1 + epSegments.length + epHosts.length + epAssets.length + epLinks.length;
 
     seedDocs.push({
       documentId: `ep-${pad(i)}`,
@@ -660,7 +614,6 @@ export const generateCmsTape = (
       chapters: [],
       segmentIds: epSegments,
       hostIds: epHosts,
-      tagIds: epTags,
       managedLinkIds: epLinks,
       mediaAssetIds: epAssets,
       bodyHash: `sha256:notes${pad(i)}`,
@@ -677,7 +630,6 @@ export const generateCmsTape = (
       shows,
       channelWelcomes,
       hosts,
-      taxonomyTags,
       managedLinks,
       mediaAssets,
       segments,
@@ -697,8 +649,6 @@ export const generateCmsTape = (
       publishedValidMasterId: "master-00000",
       draftOnlyMasterId: "master-00001",
       noHighlightMasterId: "master-00002",
-      primarySegmentId: "seg-00000",
-      secondaryTagId: "tag-00002",
       referencedAssetId: "asset-00000",
       missingRefId: "asset-does-not-exist",
     },

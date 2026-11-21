@@ -11,8 +11,6 @@ import {
   DraftSaved,
   PublishWorkspace,
   SaveDraft,
-  SegmentTagsCascaded,
-  SyncSegmentTags,
   WorkspacePublished,
 } from "./Workspace.commands.ts";
 import {
@@ -93,11 +91,11 @@ const checkClipOnlyRule = (
  * 1. Optimistic per-document expected revision
  * 2. Scoped `show.slug` uniqueness per `ownershipType` (`internal` / `partner`)
  * 3. Multi-parent `episode.slug` & `releaseDate` uniqueness within every owning `show`
- * 4. Strong reference integrity across 9 podcast document types
+ * 4. Strong reference integrity across 8 podcast document types
  * 5. Delete-in-use protection across drafts and published docs
  * 6. Published playable `audioMaster` gate on episode publish
  * 7. Cross-doc multi-hop `clipOnlyMode` validation (partner show + 1 valid highlight chapter)
- * 8. Atomic multi-document publish + cascading `segment` tag sync
+ * 8. Atomic multi-document publish
  *
  * Friction at 25,000 documents:
  * Because `@alchemy.run/domain/DurableObjects` serializes all `WorkspaceState`
@@ -108,14 +106,7 @@ export class Workspace extends Domain.Aggregate("Workspace", {
   id: WorkspaceId,
   state: WorkspaceState,
   initial: initialWorkspaceState,
-  commands: [
-    SaveDraft,
-    BulkImportDocuments,
-    DeleteDocument,
-    PublishWorkspace,
-    SyncSegmentTags,
-    DiscardDraft,
-  ],
+  commands: [SaveDraft, BulkImportDocuments, DeleteDocument, PublishWorkspace, DiscardDraft],
   keyOf: (cmd) => cmd.workspaceId,
   decide: {
     SaveDraft: (state, cmd, ctx) => {
@@ -293,38 +284,6 @@ export class Workspace extends Domain.Aggregate("Workspace", {
         }),
       ];
     },
-    SyncSegmentTags: (state, cmd, ctx) => {
-      const seg = state.documents[cmd.segmentId];
-      if (!seg || seg.kind !== "segment") {
-        return new DocumentNotFound({ documentId: cmd.segmentId });
-      }
-      const missingTag = findMissingTarget(state.documents, cmd.tagIds);
-      if (missingTag !== null) {
-        return new StrongReferenceViolation({
-          targetId: missingTag,
-          referencedBy: [cmd.segmentId],
-          reason: "target_missing",
-        });
-      }
-      const updatedEpisodeIds: Array<DocumentId> = [];
-      for (const doc of Object.values(state.documents)) {
-        if (
-          doc.kind === "episode" &&
-          doc.publishedRevision !== null &&
-          doc.segmentIds[0] === cmd.segmentId
-        ) {
-          updatedEpisodeIds.push(doc.id);
-        }
-      }
-      return [
-        new SegmentTagsCascaded({
-          segmentId: cmd.segmentId,
-          tagIds: cmd.tagIds,
-          updatedEpisodeIds,
-          syncedAt: DateTime.toEpochMillis(ctx.now),
-        }),
-      ];
-    },
     DiscardDraft: (state, cmd, ctx) => {
       const existing = state.documents[cmd.documentId];
       if (!existing || existing.publishedRevision === null) {
@@ -358,7 +317,6 @@ export class Workspace extends Domain.Aggregate("Workspace", {
         chapters: event.chapters,
         segmentIds: event.segmentIds,
         hostIds: event.hostIds,
-        tagIds: event.tagIds,
         managedLinkIds: event.managedLinkIds,
         mediaAssetIds: event.mediaAssetIds,
         bodyHash: event.bodyHash,
@@ -425,23 +383,6 @@ export class Workspace extends Domain.Aggregate("Workspace", {
         documents: nextDocs,
       };
     },
-    SegmentTagsCascaded: (state, event) => {
-      const nextDocs = { ...state.documents };
-      const seg = nextDocs[event.segmentId];
-      if (seg) {
-        nextDocs[event.segmentId] = { ...seg, tagIds: event.tagIds, updatedAt: event.syncedAt };
-      }
-      for (const epId of event.updatedEpisodeIds) {
-        const ep = nextDocs[epId];
-        if (!ep) continue;
-        nextDocs[epId] = { ...ep, tagIds: event.tagIds, updatedAt: event.syncedAt };
-      }
-      return {
-        ...state,
-        version: state.version + 1,
-        documents: nextDocs,
-      };
-    },
     DraftDiscarded: (state, event) => {
       const doc = state.documents[event.documentId];
       if (!doc || doc.publishedRevision === null) return state;
@@ -483,10 +424,6 @@ export class Workspace extends Domain.Aggregate("Workspace", {
     PublishWorkspace: (_state, events) => {
       const pub = events.find((e) => e._tag === "WorkspacePublished");
       return { publishedCount: pub ? pub.documentIds.length : 0 };
-    },
-    SyncSegmentTags: (_state, events) => {
-      const synced = events.find((e) => e._tag === "SegmentTagsCascaded");
-      return { updatedEpisodeIds: synced ? synced.updatedEpisodeIds : [] };
     },
     DiscardDraft: (_state, events) => {
       const discarded = events.find((e) => e._tag === "DraftDiscarded");

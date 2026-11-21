@@ -36,7 +36,6 @@ const DraftPayloadFields = {
   chapters: Schema.Array(AudioChapterSection),
   segmentIds: Schema.Array(DocumentId),
   hostIds: Schema.Array(DocumentId),
-  tagIds: Schema.Array(DocumentId),
   managedLinkIds: Schema.Array(DocumentId),
   mediaAssetIds: Schema.Array(DocumentId),
   bodyHash: Schema.String,
@@ -63,13 +62,6 @@ export class DocumentDeleted extends Domain.Event("DocumentDeleted", {
 export class WorkspacePublished extends Domain.Event("WorkspacePublished", {
   documentIds: Schema.Array(DocumentId),
   publishedAt: Schema.Number,
-}) {}
-
-export class SegmentTagsCascaded extends Domain.Event("SegmentTagsCascaded", {
-  segmentId: DocumentId,
-  tagIds: Schema.Array(DocumentId),
-  updatedEpisodeIds: Schema.Array(DocumentId),
-  syncedAt: Schema.Number,
 }) {}
 
 export class DraftDiscarded extends Domain.Event("DraftDiscarded", {
@@ -130,21 +122,6 @@ export class PublishWorkspace extends Domain.Command("PublishWorkspace", {
     ClipOnlyRuleViolation,
   ],
   reply: { publishedCount: Schema.Int },
-}) {}
-
-/**
- * Updates a `segment`'s taxonomy tags and atomically cascades them to every
- * published `episode` whose primary segment (`segmentIds[0]`) is this segment.
- */
-export class SyncSegmentTags extends Domain.Command("SyncSegmentTags", {
-  input: {
-    workspaceId: WorkspaceId,
-    segmentId: DocumentId,
-    tagIds: Schema.Array(DocumentId),
-  },
-  events: [SegmentTagsCascaded],
-  rejects: [DocumentNotFound, StrongReferenceViolation],
-  reply: { updatedEpisodeIds: Schema.Array(DocumentId) },
 }) {}
 
 export class DiscardDraft extends Domain.Command("DiscardDraft", {

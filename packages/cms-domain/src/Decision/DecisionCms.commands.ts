@@ -17,18 +17,15 @@ import {
   CmsDocumentDeleted,
   CmsDocumentPublished,
   CmsDraftSaved,
-  CmsTagsSynced,
   DraftFields,
   InboundRefAdded,
   InboundRefRemoved,
-  SegmentEpisodeLinked,
-  SegmentEpisodeUnlinked,
 } from "./DecisionCms.aggregates.ts";
 
 /**
  * A decision reads only the instances `keyOf` names, and `keyOf` sees only the
  * command. Instances that follow from a document's *current* state (the
- * claims it holds, the documents it references, the segment index it sits in)
+ * claims it holds and the documents it references)
  * therefore have to be named by the caller, from what it last read. The
  * decision checks it was given every instance it needs, and refuses with
  * `StaleRead` otherwise; the caller re-reads and retries.
@@ -36,7 +33,7 @@ import {
 export class StaleRead extends Domain.Rejection(
   "StaleRead",
   {
-    missing: Schema.Literals(["claim", "inboundRefs", "segmentIndex", "document", "episodeSet"]),
+    missing: Schema.Literals(["claim", "inboundRefs", "document"]),
     id: Schema.String,
   },
   { httpApiStatus: 409 },
@@ -46,20 +43,12 @@ export class StaleRead extends Domain.Rejection(
 export const Observed = Schema.Struct({
   claimKeys: Schema.Array(ClaimKey),
   references: Schema.Array(DocumentId),
-  indexedSegments: Schema.Array(DocumentId),
 });
 export type Observed = typeof Observed.Type;
 
-export const noneObserved: Observed = { claimKeys: [], references: [], indexedSegments: [] };
+export const noneObserved: Observed = { claimKeys: [], references: [] };
 
-const AllWrites = [
-  ClaimTaken,
-  ClaimReleased,
-  InboundRefAdded,
-  InboundRefRemoved,
-  SegmentEpisodeLinked,
-  SegmentEpisodeUnlinked,
-] as const;
+const AllWrites = [ClaimTaken, ClaimReleased, InboundRefAdded, InboundRefRemoved] as const;
 
 export class SaveCmsDraft extends Domain.Command("SaveCmsDraft", {
   input: {
@@ -105,17 +94,4 @@ export class PublishCmsDocuments extends Domain.Command("PublishCmsDocuments", {
     ClipOnlyRuleViolation,
     StaleRead,
   ],
-}) {}
-
-export class SyncCmsSegmentTags extends Domain.Command("SyncCmsSegmentTags", {
-  input: {
-    segmentId: DocumentId,
-    tagIds: Schema.Array(DocumentId),
-    /** The published episodes the caller last saw on this segment's index. */
-    episodeIds: Schema.Array(DocumentId),
-    observed: Observed,
-  },
-  events: [CmsTagsSynced, ...AllWrites],
-  rejects: [DocumentNotFound, StrongReferenceViolation, StaleRead],
-  reply: { updatedEpisodeIds: Schema.Array(DocumentId) },
 }) {}

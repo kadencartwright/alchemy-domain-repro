@@ -21,8 +21,6 @@ import { allStrongRefsOf, DocumentMeta } from "../Workspace/WorkspaceState.ts";
  *   an episode slug or release date per show), held by at most one document.
  * - `InboundRefs(documentId)`: which documents strongly reference this one
  *   (drafts and published), for delete-in-use.
- * - `SegmentEpisodes(segmentId)`: published episodes whose primary segment
- *   this is, for the tag cascade.
  */
 
 export const ClaimKey = Schema.String.pipe(Schema.brand("ClaimKey"));
@@ -43,7 +41,6 @@ export const DraftFields = {
   chapters: Schema.Array(AudioChapterSection),
   segmentIds: Schema.Array(DocumentId),
   hostIds: Schema.Array(DocumentId),
-  tagIds: Schema.Array(DocumentId),
   managedLinkIds: Schema.Array(DocumentId),
   mediaAssetIds: Schema.Array(DocumentId),
   bodyHash: Schema.String,
@@ -68,11 +65,6 @@ export class CmsDocumentDeleted extends Domain.Event("CmsDocumentDeleted", {
   deletedAt: Schema.Number,
 }) {}
 
-export class CmsTagsSynced extends Domain.Event("CmsTagsSynced", {
-  tagIds: Schema.Array(DocumentId),
-  syncedAt: Schema.Number,
-}) {}
-
 /** Loads an existing document (corpus seeding through `import`). */
 export class CmsDocumentImported extends Domain.Event("CmsDocumentImported", {
   document: DocumentMeta,
@@ -85,13 +77,7 @@ export class CmsDocument extends Domain.Aggregate("CmsDocument", {
   id: DocumentId,
   state: CmsDocumentState,
   initial: null,
-  events: [
-    CmsDraftSaved,
-    CmsDocumentPublished,
-    CmsDocumentDeleted,
-    CmsTagsSynced,
-    CmsDocumentImported,
-  ],
+  events: [CmsDraftSaved, CmsDocumentPublished, CmsDocumentDeleted, CmsDocumentImported],
   evolve: {
     CmsDraftSaved: (prev, e, envelope) => ({
       id: envelope.id,
@@ -109,7 +95,6 @@ export class CmsDocument extends Domain.Aggregate("CmsDocument", {
       chapters: e.chapters,
       segmentIds: e.segmentIds,
       hostIds: e.hostIds,
-      tagIds: e.tagIds,
       managedLinkIds: e.managedLinkIds,
       mediaAssetIds: e.mediaAssetIds,
       bodyHash: e.bodyHash,
@@ -140,8 +125,6 @@ export class CmsDocument extends Domain.Aggregate("CmsDocument", {
       };
     },
     CmsDocumentDeleted: () => null,
-    CmsTagsSynced: (doc, e) =>
-      doc === null ? doc : { ...doc, tagIds: e.tagIds, updatedAt: e.syncedAt },
     CmsDocumentImported: (_, e) => e.document,
   },
 }) {}
@@ -193,39 +176,6 @@ export class InboundRefs extends Domain.Aggregate("InboundRefs", {
   },
 }) {}
 
-// --- SegmentEpisodes -------------------------------------------------------
-
-export class SegmentEpisodeLinked extends Domain.Event("SegmentEpisodeLinked", {
-  episodeId: DocumentId,
-}) {}
-export class SegmentEpisodeUnlinked extends Domain.Event("SegmentEpisodeUnlinked", {
-  episodeId: DocumentId,
-}) {}
-/** Seeds a segment's published episodes in one event (corpus seeding through `import`). */
-export class SegmentEpisodesImported extends Domain.Event("SegmentEpisodesImported", {
-  episodeIds: Schema.Array(DocumentId),
-}) {}
-
-export class SegmentEpisodes extends Domain.Aggregate("SegmentEpisodes", {
-  id: DocumentId,
-  state: Schema.Struct({ episodes: Schema.Record(Schema.String, Schema.Boolean) }),
-  initial: { episodes: {} },
-  events: [SegmentEpisodeLinked, SegmentEpisodeUnlinked, SegmentEpisodesImported],
-  evolve: {
-    SegmentEpisodeLinked: (s, e) => ({ episodes: { ...s.episodes, [e.episodeId]: true } }),
-    SegmentEpisodeUnlinked: (s, e) => {
-      const episodes = { ...s.episodes };
-      delete episodes[e.episodeId];
-      return { episodes };
-    },
-    SegmentEpisodesImported: (s, e) => {
-      const episodes = { ...s.episodes };
-      for (const id of e.episodeIds) episodes[id] = true;
-      return { episodes };
-    },
-  },
-}) {}
-
 // --- What a document implies about the other aggregates -------------------
 
 type ClaimSource = Pick<
@@ -254,27 +204,16 @@ export const claimKeysOf = (doc: ClaimSource | null): Array<ClaimKey> => {
 export const referencesOf = (doc: DocumentMeta | null): Array<DocumentId> =>
   doc === null ? [] : [...new Set([...allStrongRefsOf(doc), ...doc.publishedStrongRefs])];
 
-/** The segment whose `SegmentEpisodes` lists this document, if any. */
-export const indexedSegmentOf = (doc: DocumentMeta | null): DocumentId | null =>
-  doc !== null && doc.kind === "episode" && doc.publishedRevision !== null
-    ? (doc.segmentIds[0] ?? null)
-    : null;
-
 /**
  * What a caller that last read these documents names in a command's
- * `observed`: the claims they hold, the documents they reference, and the
- * segment indexes they sit in.
+ * `observed`: the claims they hold and the documents they reference.
  */
 export const observedFor = (
   docs: ReadonlyArray<DocumentMeta | null>,
 ): {
   claimKeys: Array<ClaimKey>;
   references: Array<DocumentId>;
-  indexedSegments: Array<DocumentId>;
 } => ({
   claimKeys: [...new Set(docs.flatMap((d) => claimKeysOf(d)))],
   references: [...new Set(docs.flatMap((d) => referencesOf(d)))],
-  indexedSegments: [
-    ...new Set(docs.flatMap((d) => (indexedSegmentOf(d) === null ? [] : [indexedSegmentOf(d)!]))),
-  ],
 });
