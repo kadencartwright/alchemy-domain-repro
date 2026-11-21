@@ -17,6 +17,42 @@ import * as Layer from "effect/Layer";
 import { expect } from "vitest";
 import { createInstrumentedDoPlatform } from "../scripts/instrumented-do-platform.ts";
 
+const podcastDraft = (overrides: {
+  documentId: DocumentId;
+  expectedRevision: number | null;
+  title: string;
+  kind: "show" | "episode" | "mediaAsset";
+  slug?: string | null;
+  ownershipType?: "internal" | "partner" | null;
+  showIds?: ReadonlyArray<DocumentId>;
+  releaseDate?: string | null;
+  bodyHash: string;
+}) => ({
+  documentId: overrides.documentId,
+  expectedRevision: overrides.expectedRevision,
+  title: overrides.title,
+  kind: overrides.kind,
+  slug: overrides.slug ?? null,
+  ownershipType: overrides.ownershipType ?? null,
+  showIds: overrides.showIds ?? [],
+  releaseDate: overrides.releaseDate ?? null,
+  audioMasterId: null,
+  clipOnlyMode: false,
+  closerKind: "none" as const,
+  playableAudio: false,
+  durationSeconds: null,
+  chapters: [],
+  segmentIds: [],
+  hostIds: [],
+  tagIds: [],
+  managedLinkIds: [],
+  mediaAssetIds: [],
+  bodyHash: overrides.bodyHash,
+  strongRefs: [],
+  strengthenOnPublish: [],
+  retiredAt: null,
+});
+
 it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", () =>
   Effect.gen(function* () {
     const host = createInstrumentedDoPlatform();
@@ -28,19 +64,37 @@ it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", ()
     yield* Effect.gen(function* () {
       const workspace = yield* Workspace;
       const wsId = WorkspaceId.make("test-ws");
+      const showId = DocumentId.make("show-0");
+      yield* workspace.send(
+        wsId,
+        new SaveDraft(
+          podcastDraft({
+            documentId: showId,
+            expectedRevision: null,
+            title: "Main Show",
+            kind: "show",
+            slug: "main-show",
+            ownershipType: "internal",
+            bodyHash: "sha256:show-0",
+          }),
+        ),
+        { commandId: "seed-show" },
+      );
       for (let i = 0; i < 40; i++) {
         yield* workspace.send(
           wsId,
-          new SaveDraft({
-            documentId: DocumentId.make(`d-${i}`),
-            expectedRevision: null,
-            title: `Article ${i}`,
-            kind: "article",
-            releaseDate: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10),
-            bodyHash: `sha256:${String(i).padStart(64, "0")}`,
-            strongRefs: [],
-            strengthenOnPublish: [],
-          }),
+          new SaveDraft(
+            podcastDraft({
+              documentId: DocumentId.make(`ep-${i}`),
+              expectedRevision: null,
+              title: `Episode ${i}`,
+              kind: "episode",
+              slug: `ep-${i}`,
+              showIds: [showId],
+              releaseDate: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10),
+              bodyHash: `sha256:${String(i).padStart(64, "0")}`,
+            }),
+          ),
           { commandId: `seed-${i}` },
         );
       }
@@ -49,22 +103,24 @@ it.live("CMS Workspace DO rewrites full meta blob on each single-field edit", ()
 
       yield* workspace.send(
         wsId,
-        new SaveDraft({
-          documentId: DocumentId.make("d-0"),
-          expectedRevision: 1,
-          title: "Article 0 Edited",
-          kind: "article",
-          releaseDate: "2026-01-01",
-          bodyHash: `sha256:${"0".padStart(64, "0")}`,
-          strongRefs: [],
-          strengthenOnPublish: [],
-        }),
+        new SaveDraft(
+          podcastDraft({
+            documentId: DocumentId.make("ep-0"),
+            expectedRevision: 1,
+            title: "Episode 0 Edited",
+            kind: "episode",
+            slug: "ep-0",
+            showIds: [showId],
+            releaseDate: "2026-01-01",
+            bodyHash: `sha256:${"0".padStart(64, "0")}`,
+          }),
+        ),
         { commandId: "edit-0" },
       );
       yield* host.drainBackground;
 
-      const wsMetric = host.inspectAll().find((m) => m.className.includes("WorkspaceAggregate"))!;
-      expect(wsMetric.metaBytes).toBeGreaterThan(10_000);
+      const wsMetric = host.inspectAll().find((m) => m.instanceName === "test-ws")!;
+      expect(wsMetric.metaBytes).toBeGreaterThan(15_000);
       expect(wsMetric.totalPutBytes).toBeGreaterThan(wsMetric.metaBytes);
     }).pipe(Effect.provide(layer));
 
@@ -116,7 +172,6 @@ it.live("Quota Market DO + ScheduleLeaseExpiry accumulates per-reservation callb
       yield* host.drainBackground;
 
       const marketMetric = host.inspectAll().find((m) => m.className.includes("MarketAggregate"))!;
-      // 10 paired opportunities -> 20 individual scheduled expiry callback jobs.
       expect(marketMetric.keysByPrefix["armed:*"]?.count).toBe(20);
       expect(marketMetric.keysByPrefix["scheduled:*"]?.count).toBe(20);
       expect(marketMetric.keysByPrefix["cb:*"]?.count).toBeGreaterThanOrEqual(20);
@@ -139,16 +194,15 @@ it.live("WorkspaceCmsApi supports read-your-writes Query via atLeast", () =>
       const wsId = WorkspaceId.make("ws-api");
       const receipt = yield* api.SaveDraft(
         wsId,
-        {
-          documentId: DocumentId.make("doc-a"),
+        podcastDraft({
+          documentId: DocumentId.make("ep-ryw"),
           expectedRevision: null,
-          title: "Indexed Article",
-          kind: "article",
+          title: "Indexed Podcast Episode",
+          kind: "episode",
+          slug: "indexed-podcast-episode",
           releaseDate: "2026-11-24",
           bodyHash: "sha256:a",
-          strongRefs: [],
-          strengthenOnPublish: [],
-        },
+        }),
         { commandId: "api-1" },
       );
       const page = yield* api.SearchCatalog(
@@ -156,7 +210,7 @@ it.live("WorkspaceCmsApi supports read-your-writes Query via atLeast", () =>
         { atLeast: receipt },
       );
       expect(page.entries).toHaveLength(1);
-      expect(page.entries[0]?.title).toBe("Indexed Article");
+      expect(page.entries[0]?.title).toBe("Indexed Podcast Episode");
     }).pipe(Effect.scoped, Effect.provide(layer));
 
     yield* host.close;

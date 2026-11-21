@@ -2,13 +2,13 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { DocumentId, Revision, WorkspaceId } from "../Ids.ts";
+import { DocumentId, PodcastDocKind, Revision, WorkspaceId } from "../Ids.ts";
 
 export const CatalogRow = Schema.Struct({
   workspaceId: WorkspaceId,
   documentId: DocumentId,
   title: Schema.String,
-  kind: Schema.Literals(["article", "series", "asset"]),
+  kind: PodcastDocKind,
   releaseDate: Schema.NullOr(Schema.String),
   revision: Revision,
   published: Schema.Boolean,
@@ -24,7 +24,7 @@ export interface CatalogPage {
 export interface CatalogSearchParams {
   readonly workspaceId: WorkspaceId;
   readonly query?: string;
-  readonly kind?: "article" | "series" | "asset";
+  readonly kind?: PodcastDocKind;
   readonly publishedOnly?: boolean;
   readonly after?: string | null;
   readonly take: number;

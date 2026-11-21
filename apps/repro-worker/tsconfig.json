@@ -1,4 +1,4 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": ["src", "scripts", "alchemy.run.ts"]
+  "include": ["src", "scripts", "benchmarks", "test", "alchemy.run.ts"]
 }

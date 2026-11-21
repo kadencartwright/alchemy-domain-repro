@@ -9,7 +9,8 @@
     "bench:workerd": "pnpm --filter @repro/worker bench:workerd",
     "bench:quota": "pnpm --filter @repro/worker bench:quota",
     "bench:cms": "pnpm --filter @repro/worker bench:cms",
-    "bench:all": "pnpm bench:workerd && pnpm bench:quota && pnpm bench:cms"
+    "bench:eval": "pnpm --filter @repro/worker bench:eval",
+    "bench:all": "pnpm bench:eval && pnpm bench:quota && pnpm bench:cms"
   },
   "devDependencies": {
     "@effect/platform-node": "4.1.5",

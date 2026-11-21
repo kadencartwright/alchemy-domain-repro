@@ -1,7 +1,7 @@
 import * as Domain from "@alchemy.run/domain";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { WorkspaceId } from "../Ids.ts";
+import { PodcastDocKind, WorkspaceId } from "../Ids.ts";
 import { CatalogIndex } from "./CatalogIndex.projection.ts";
 import { CatalogRow, CatalogStore } from "./CatalogStore.ts";
 
@@ -10,14 +10,12 @@ import { CatalogRow, CatalogStore } from "./CatalogStore.ts";
  *
  * Uses @alchemy.run/domain 2.0.0-beta.87's `waitsFor` so callers can pass
  * `{ atLeast: receipt }` for read-your-writes after a single aggregate commit.
- * (This works cleanly for a single-Workspace aggregate; in Approach B where
- * documents are split across N aggregates, one receipt only gates 1 stream.)
  */
 export class SearchCatalog extends Domain.Query("SearchCatalog", {
   input: {
     workspaceId: WorkspaceId,
     query: Schema.optional(Schema.String),
-    kind: Schema.optional(Schema.Literals(["article", "series", "asset"])),
+    kind: Schema.optional(PodcastDocKind),
     publishedOnly: Schema.optional(Schema.Boolean),
   },
   success: CatalogRow,

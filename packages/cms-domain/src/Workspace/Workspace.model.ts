@@ -14,6 +14,13 @@ export const WorkspaceCmsHandlers = Layer.mergeAll(CatalogIndexLive, SearchCatal
 
 export class WorkspaceCmsApi extends Domain.Api("WorkspaceCmsApi", {
   model: WorkspaceCms,
-  commands: ["SaveDraft", "DeleteDocument", "PublishWorkspace", "DiscardDraft"],
+  commands: [
+    "SaveDraft",
+    "BulkImportDocuments",
+    "DeleteDocument",
+    "PublishWorkspace",
+    "SyncSegmentTags",
+    "DiscardDraft",
+  ],
   queries: ["SearchCatalog"],
 }) {}
