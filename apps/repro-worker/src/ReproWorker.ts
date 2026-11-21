@@ -2,6 +2,9 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as DomainCloudflare from "@alchemy.run/domain/Cloudflare";
 import { ContentDocument, SplitDocumentCms } from "@repro/cms-domain/Document/Document.aggregate";
 import { SaveDocumentDraft } from "@repro/cms-domain/Document/Document.commands";
+import { RetireLibraryItem, SaveLibraryItem } from "@repro/cms-domain/Content/Content.aggregates";
+import { ContentClient, ContentSeeder } from "@repro/cms-domain/Content/Content.client";
+import { ContentDomain } from "@repro/cms-domain/Content/Content.model";
 import {
   DecisionCmsClient,
   type Draft,
@@ -76,6 +79,7 @@ const ModelsLive = Layer.mergeAll(
   }),
   SplitDocumentCms.layer(Layer.empty, { legacyData: false }),
   DecisionCms.layer(Layer.empty, { legacyData: false }),
+  ContentDomain.layer(Layer.empty, { legacyData: false }),
 ).pipe(Layer.provide(PlatformLive));
 
 /**
@@ -101,6 +105,8 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
     const doc = yield* ContentDocument;
     const decisionCms = yield* DecisionCmsClient;
     const seedDecisionCms = yield* DecisionCmsSeeder;
+    const content = yield* ContentClient;
+    const seedContent = yield* ContentSeeder;
 
     const handle = Effect.gen(function* () {
       const request = yield* HttpServerRequest;
@@ -587,6 +593,118 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
         if (url.pathname === "/cms/decision/get") {
           const doc = yield* decisionCms.get(DocumentId.make(body.documentId));
           return yield* HttpServerResponse.json({ ok: true, doc });
+        }
+      }
+
+      // --- Topology F: the content domain (alchemy main) ---
+      if (url.pathname.startsWith("/cms/content/")) {
+        const toIds = (arr: unknown): Array<DocumentId> =>
+          Array.isArray(arr) ? arr.map((id) => DocumentId.make(String(id))) : [];
+        const options = body.commandId ? { commandId: String(body.commandId) } : undefined;
+        const respond = <A, E extends { readonly _tag: string }>(effect: Effect.Effect<A, E>) =>
+          effect.pipe(
+            Effect.flatMap((receipt) => HttpServerResponse.json({ ok: true, receipt })),
+            Effect.catch((e) =>
+              HttpServerResponse.json(
+                { ok: false, error: e },
+                { status: e._tag === "DocumentNotFound" ? 404 : 409 },
+              ),
+            ),
+          );
+        if (url.pathname === "/cms/content/import") {
+          const counts = yield* seedContent(body.documents as ReadonlyArray<DocumentMeta>, {
+            concurrency: body.concurrency ?? 16,
+          }).pipe(Effect.orDie);
+          return yield* HttpServerResponse.json({ ok: true, counts });
+        }
+        if (url.pathname === "/cms/content/edit") {
+          return yield* respond(
+            content.edit(
+              {
+                episodeId: DocumentId.make(body.episodeId),
+                expectedRevision: body.expectedRevision ?? null,
+                title: body.title,
+                bodyHash: body.bodyHash ?? "sha256:0",
+                closerKind: body.closerKind ?? "none",
+                clipOnlyMode: body.clipOnlyMode ?? false,
+                audioMasterId: body.audioMasterId ? DocumentId.make(body.audioMasterId) : null,
+                segmentIds: toIds(body.segmentIds),
+                hostIds: toIds(body.hostIds),
+                tagIds: toIds(body.tagIds),
+                managedLinkIds: toIds(body.managedLinkIds),
+                mediaAssetIds: toIds(body.mediaAssetIds),
+              },
+              options,
+            ),
+          );
+        }
+        if (url.pathname === "/cms/content/save-show") {
+          return yield* respond(
+            content.saveShow(
+              {
+                showId: DocumentId.make(body.showId),
+                expectedRevision: body.expectedRevision ?? null,
+                title: body.title,
+                slug: body.slug,
+                ownershipType: body.ownershipType,
+              },
+              options,
+            ),
+          );
+        }
+        if (url.pathname === "/cms/content/schedule") {
+          return yield* respond(
+            content.schedule(
+              DocumentId.make(body.episodeId),
+              toIds(body.showIds),
+              body.slug ?? null,
+              body.releaseDate ?? null,
+              options,
+            ),
+          );
+        }
+        if (url.pathname === "/cms/content/publish") {
+          return yield* respond(
+            content.publish(
+              DocumentId.make(body.episodeId),
+              body.publishAudioMaster ?? false,
+              options,
+            ),
+          );
+        }
+        if (url.pathname === "/cms/content/save-item") {
+          return yield* respond(
+            content.library.send(
+              new SaveLibraryItem({
+                itemId: DocumentId.make(body.itemId),
+                expectedRevision: body.expectedRevision ?? null,
+                kind: body.kind,
+                title: body.title,
+                tagIds: toIds(body.tagIds),
+              }),
+              options,
+            ),
+          );
+        }
+        if (url.pathname === "/cms/content/retire-item") {
+          return yield* respond(
+            content.library.send(
+              new RetireLibraryItem({ itemId: DocumentId.make(body.itemId) }),
+              options,
+            ),
+          );
+        }
+        if (url.pathname === "/cms/content/get-episode") {
+          const episode = yield* content.episodes.get(DocumentId.make(body.episodeId));
+          return yield* HttpServerResponse.json({ ok: true, episode });
+        }
+        if (url.pathname === "/cms/content/get-item") {
+          const item = yield* content.library.get(DocumentId.make(body.itemId));
+          return yield* HttpServerResponse.json({ ok: true, item });
+        }
+        if (url.pathname === "/cms/content/effective-tags") {
+          const tagIds = yield* content.effectiveTags(DocumentId.make(body.episodeId));
+          return yield* HttpServerResponse.json({ ok: true, tagIds });
         }
       }
 

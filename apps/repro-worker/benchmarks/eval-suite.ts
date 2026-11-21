@@ -15,6 +15,18 @@ import {
 } from "@repro/cms-domain/Decision/DecisionCms.aggregates";
 import { seedPlanOf } from "@repro/cms-domain/Decision/DecisionCms.client";
 import { DecisionCms } from "@repro/cms-domain/Decision/DecisionCms.model";
+import {
+  AudioMaster,
+  AudioMasterImported,
+  Episode,
+  EpisodeImported,
+  LibraryItem,
+  LibraryItemImported,
+  Show,
+  ShowImported,
+} from "@repro/cms-domain/Content/Content.aggregates";
+import { contentSeedOf } from "@repro/cms-domain/Content/Content.client";
+import { ContentDomain } from "@repro/cms-domain/Content/Content.model";
 import { DocumentId, WorkspaceId } from "@repro/cms-domain/Ids";
 import { MemoryCatalogStore } from "@repro/cms-domain/Workspace/CatalogStore";
 import { Workspace } from "@repro/cms-domain/Workspace/Workspace.aggregate";
@@ -1460,9 +1472,9 @@ const runDecisionCmsOnWorkerd = async (
   const f = slice500Tape.fixtures;
   const n = (id: string) => `${p}${id}`;
   const docs = slice500Tape.seedDocs.map((d) => namespaceDoc(toDocumentMeta(d), p));
-  for (let i = 0; i < docs.length; i += 100) {
-    await postJson("/cms/decision/import", { documents: docs.slice(i, i + 100), concurrency: 16 });
-  }
+  // One import: the seed plan needs every document to derive each instance (a show's
+  // schedule, a document's referrers), so it must not be split into batches.
+  await postJson("/cms/decision/import", { documents: docs, concurrency: 16 });
   const editMeta = docs.find((d) => d.id === n(f.editEpisodeId))!;
   const {
     id: _id,
@@ -1717,6 +1729,326 @@ const runDecisionCmsOnWorkerd = async (
 };
 
 // ---------------------------------------------------------------------------
+// Topology F: the content domain (alchemy main)
+// ---------------------------------------------------------------------------
+
+/**
+ * Exact `"meta"` bytes of the heaviest instance of each Topology F aggregate at
+ * 25,000 documents: the show with the most episodes (its schedule), the edited
+ * episode, its audio master, and the most-tagged segment.
+ */
+const measureContentStorage25k = (full25kTape: CmsTape) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const docs = full25kTape.seedDocs.map(toDocumentMeta);
+      const plan = contentSeedOf(docs);
+      const hotShow = plan.shows.reduce((a, b) =>
+        Object.keys(b.show.episodeSlugs).length > Object.keys(a.show.episodeSlugs).length ? b : a,
+      );
+      const edit = plan.episodes.find((e) => e.id === full25kTape.fixtures.editEpisodeId)!;
+      const master = plan.masters.find((m) => m.id === edit.episode.audioMasterId)!;
+      const segment = plan.items
+        .filter((i) => i.item.kind === "segment")
+        .reduce((a, b) => (b.item.tagIds.length > a.item.tagIds.length ? b : a));
+
+      const host = createInstrumentedDoPlatform();
+      const layer = ContentDomain.layer(Layer.empty, { legacyData: false }).pipe(
+        Layer.provide(host.layer),
+      );
+      yield* Effect.gen(function* () {
+        const shows = yield* Show;
+        const episodes = yield* Episode;
+        const masters = yield* AudioMaster;
+        const library = yield* LibraryItem;
+        yield* shows.import(hotShow.id, [new ShowImported({ show: hotShow.show })], {
+          commandId: "seed-show",
+        });
+        yield* episodes.import(edit.id, [new EpisodeImported({ episode: edit.episode })], {
+          commandId: "seed-ep",
+        });
+        yield* masters.import(master.id, [new AudioMasterImported({ master: master.master })], {
+          commandId: "seed-master",
+        });
+        yield* library.import(segment.id, [new LibraryItemImported({ item: segment.item })], {
+          commandId: "seed-seg",
+        });
+      }).pipe(Effect.provide(layer));
+      const all = host.inspectAll();
+      const metaOf = (name: string) => all.find((m) => m.instanceName === name)?.metaBytes ?? 0;
+      const result = {
+        episodeMetaBytes: metaOf(edit.id),
+        hotShowMetaBytes: metaOf(hotShow.id),
+        hotShowEpisodeCount: Object.keys(hotShow.show.episodeSlugs).length,
+        masterMetaBytes: metaOf(master.id),
+        segmentMetaBytes: metaOf(segment.id),
+        instanceCounts: {
+          shows: plan.shows.length,
+          episodes: plan.episodes.length,
+          audioMasters: plan.masters.length,
+          libraryItems: plan.items.length,
+        },
+      };
+      yield* host.close;
+      return result;
+    }),
+  );
+
+const runContentDomainOnWorkerd = async (
+  runId: string,
+  full25kTape: CmsTape,
+  slice500Tape: CmsTape,
+) => {
+  const storage = await measureContentStorage25k(full25kTape);
+  const p = `f-${runId}-`;
+  const f = slice500Tape.fixtures;
+  const n = (id: string) => `${p}${id}`;
+  const docs = slice500Tape.seedDocs.map((d) => namespaceDoc(toDocumentMeta(d), p));
+  // One import: the seed plan needs every document to derive each instance (a show's
+  // schedule, a document's referrers), so it must not be split into batches.
+  await postJson("/cms/content/import", { documents: docs, concurrency: 16 });
+  const editMeta = docs.find((d) => d.id === n(f.editEpisodeId))!;
+  const content = {
+    title: editMeta.title,
+    bodyHash: editMeta.bodyHash,
+    closerKind: editMeta.closerKind,
+    clipOnlyMode: false,
+    audioMasterId: editMeta.audioMasterId,
+    segmentIds: editMeta.segmentIds,
+    hostIds: editMeta.hostIds,
+    tagIds: editMeta.tagIds,
+    managedLinkIds: editMeta.managedLinkIds,
+    mediaAssetIds: editMeta.mediaAssetIds,
+  };
+  const newEpisode = (episodeId: string, extra: Record<string, unknown> = {}) =>
+    postJson("/cms/content/edit", { ...content, episodeId, expectedRevision: null, ...extra });
+  type R = { ok: boolean; error?: { _tag: string } };
+
+  // (1) stale revision on an autosave
+  const f1 = await postJson("/cms/content/edit", {
+    ...content,
+    episodeId: editMeta.id,
+    expectedRevision: 999,
+  });
+  // (2) show slug per ownership type
+  const f2 = await postJson("/cms/content/save-show", {
+    showId: n("show-dup-slug"),
+    expectedRevision: null,
+    title: "Dup Show",
+    slug: n(f.internalShowSlug),
+    ownershipType: "internal",
+  });
+  // (3) episode slug per owning show
+  await newEpisode(n("ep-dup-slug"));
+  const f3 = await postJson("/cms/content/schedule", {
+    episodeId: n("ep-dup-slug"),
+    showIds: editMeta.showIds,
+    slug: n(f.editEpisodeSlug),
+    releaseDate: "2029-12-30",
+  });
+  // (4, restated) a missing reference is allowed in a draft and refused at publish
+  const f4edit = await newEpisode(n("ep-dangling"), { mediaAssetIds: [n(f.missingRefId)] });
+  const f4 = await postJson("/cms/content/publish", { episodeId: n("ep-dangling") });
+  // (6) an unpublished audio master blocks publish
+  await newEpisode(n("ep-unpub-master"), { audioMasterId: n(f.draftOnlyMasterId) });
+  const f6 = await postJson("/cms/content/publish", { episodeId: n("ep-unpub-master") });
+  // (7, checked at publish) clipOnlyMode needs a partner show and one valid highlight
+  await newEpisode(n("ep-clip-internal"), {
+    clipOnlyMode: true,
+    audioMasterId: n(f.publishedValidMasterId),
+  });
+  await postJson("/cms/content/schedule", {
+    episodeId: n("ep-clip-internal"),
+    showIds: [n(f.internalShowId)],
+    slug: n("ep-clip-internal"),
+    releaseDate: "2029-12-27",
+  });
+  const f7a = await postJson<R>("/cms/content/publish", { episodeId: n("ep-clip-internal") });
+  await newEpisode(n("ep-clip-no-hl"), {
+    clipOnlyMode: true,
+    audioMasterId: n(f.noHighlightMasterId),
+  });
+  await postJson("/cms/content/schedule", {
+    episodeId: n("ep-clip-no-hl"),
+    showIds: [n(f.partnerShowId)],
+    slug: n("ep-clip-no-hl"),
+    releaseDate: "2029-12-26",
+  });
+  const f7b = await postJson<R>("/cms/content/publish", { episodeId: n("ep-clip-no-hl") });
+  // (8a) publish an episode with its audio master in one step
+  const f8a = await postJson("/cms/content/publish", {
+    episodeId: n("ep-unpub-master"),
+    publishAudioMaster: true,
+  });
+  // (8b, restated) the episode's tags follow its primary segment when read
+  const seg = await postJson<{ item: { revision: number; kind: string; title: string } }>(
+    "/cms/content/get-item",
+    {
+      itemId: n(f.primarySegmentId),
+    },
+  );
+  await postJson("/cms/content/save-item", {
+    itemId: n(f.primarySegmentId),
+    expectedRevision: seg.data.item.revision,
+    kind: seg.data.item.kind,
+    title: seg.data.item.title,
+    tagIds: [n(f.secondaryTagId)],
+  });
+  const f8b = await postJson<{ tagIds: Array<string> }>("/cms/content/effective-tags", {
+    episodeId: editMeta.id,
+  });
+  // (5, restated) retiring is always allowed; publishing against retired content is refused
+  const f5retire = await postJson("/cms/content/retire-item", { itemId: n(f.referencedAssetId) });
+  await newEpisode(n("ep-uses-retired"), { mediaAssetIds: [n(f.referencedAssetId)] });
+  const f5 = await postJson("/cms/content/publish", { episodeId: n("ep-uses-retired") });
+
+  const checks = [
+    f1.status === 409,
+    f2.status === 409,
+    f3.status === 409,
+    f4edit.status === 200 && f4.status === 409,
+    f5retire.status === 200 && f5.status === 409,
+    f6.status === 409,
+    f7a.data.error?._tag === "ClipOnlyRuleViolation" &&
+      f7b.data.error?._tag === "ClipOnlyRuleViolation",
+    f8a.status === 200 && f8b.data.tagIds.includes(n(f.secondaryTagId)),
+  ];
+  const invariants: CmsInvariantResults = {
+    staleRevisionRejected: checks[0]!,
+    scopedShowSlugRejected: checks[1]!,
+    perShowEpisodeSlugRejected: checks[2]!,
+    danglingRefRejected: checks[3]!,
+    deleteInUseRejected: checks[4]!,
+    unpublishedAudioMasterRejected: checks[5]!,
+    clipOnlyRuleRejected: checks[6]!,
+    atomicPublishAndTagCascadeSucceeded: checks[7]!,
+    passedCount: checks.filter(Boolean).length,
+  };
+  if (invariants.passedCount < 8) {
+    console.log(
+      "Topology F probe statuses:",
+      [f1, f2, f3, f4edit, f4, f5retire, f5, f6, f7a, f7b, f8a].map((r) => r.status),
+      f8b.data,
+    );
+  }
+
+  // Autosaves: content edits are plain commands on the episode.
+  const current = await postJson<{ episode: { revision: number } }>("/cms/content/get-episode", {
+    episodeId: editMeta.id,
+  });
+  let revision = current.data.episode.revision;
+  const lats: Array<number> = [];
+  for (let e = 0; e < slice500Tape.editCount; e++) {
+    const res = await postJson<{ ok: boolean; receipt?: { reply: { revision: number } } }>(
+      "/cms/content/edit",
+      {
+        ...content,
+        clipOnlyMode: editMeta.clipOnlyMode,
+        episodeId: editMeta.id,
+        expectedRevision: revision,
+        title: `${editMeta.title} (autosave ${e + 1})`,
+        bodyHash: `sha256:edit${String(e).padStart(59, "0")}`,
+        commandId: `edit-content-${runId}-${e}`,
+      },
+    );
+    lats.push(res.ms);
+    if (res.data.ok && res.data.receipt) revision = res.data.receipt.reply.revision;
+  }
+  lats.sort((a, b) => a - b);
+
+  // Contention around one hot show.
+  // (a) K episodes autosaved at once: separate aggregates, nothing shared.
+  // (b) K new episodes scheduled into the same show at once: every decision
+  //     records on that show, so all K prepare and hold it.
+  const hotShow = n(f.internalShowId);
+  const maxK = 32;
+  const contenders: Array<{ id: string; revision: number }> = [];
+  for (let k = 0; k < maxK; k++) {
+    const id = n(`contender-${k}`);
+    await newEpisode(id);
+    contenders.push({ id, revision: 1 });
+  }
+  const level = (
+    concurrency: number,
+    results: ReadonlyArray<{ ms: number; ok: boolean }>,
+  ): ContentionLevel => {
+    const sorted = results.map((r) => r.ms).sort((x, y) => x - y);
+    return {
+      concurrency,
+      p50Ms: percentile(sorted, 50),
+      p95Ms: percentile(sorted, 95),
+      maxMs: sorted[sorted.length - 1] ?? 0,
+      failed: results.filter((r) => !r.ok).length,
+      total: results.length,
+    };
+  };
+  const contention: { autosave: Array<ContentionLevel>; schedule: Array<ContentionLevel> } = {
+    autosave: [],
+    schedule: [],
+  };
+  let day = 0;
+  for (const k of [1, 8, 32]) {
+    const autosaves: Array<{ ms: number; ok: boolean }> = [];
+    const schedules: Array<{ ms: number; ok: boolean }> = [];
+    for (let round = 0; round < 3; round++) {
+      const a = await Promise.all(
+        contenders.slice(0, k).map(async (c) => {
+          const res = await postJson<{ ok: boolean; receipt?: { reply: { revision: number } } }>(
+            "/cms/content/edit",
+            {
+              ...content,
+              episodeId: c.id,
+              expectedRevision: c.revision,
+              title: `Contender edit ${round}`,
+            },
+          );
+          if (res.data.ok && res.data.receipt) c.revision = res.data.receipt.reply.revision;
+          return { ms: res.ms, ok: res.status === 200 && res.data.ok };
+        }),
+      );
+      autosaves.push(...a);
+      const fresh = Array.from({ length: k }, (_, i) => n(`sched-${k}-${round}-${i}`));
+      for (const id of fresh) await newEpisode(id);
+      const b = await Promise.all(
+        fresh.map(async (id) => {
+          day += 1;
+          const res = await postJson<{ ok: boolean }>("/cms/content/schedule", {
+            episodeId: id,
+            showIds: [hotShow],
+            slug: id,
+            releaseDate: `2031-${String(1 + Math.floor(day / 28)).padStart(2, "0")}-${String(1 + (day % 28)).padStart(2, "0")}`,
+          });
+          return { ms: res.ms, ok: res.status === 200 && res.data.ok };
+        }),
+      );
+      schedules.push(...b);
+    }
+    contention.autosave.push(level(k, autosaves));
+    contention.schedule.push(level(k, schedules));
+  }
+
+  const maxSingleDoMetaAt25kBytes = Math.max(
+    storage.episodeMetaBytes,
+    storage.hotShowMetaBytes,
+    storage.masterMetaBytes,
+    storage.segmentMetaBytes,
+  );
+  const result: CmsBenchmarkResult = {
+    invariants,
+    editP50Ms: percentile(lats, 50),
+    editP95Ms: percentile(lats, 95),
+    editMetaBytes: storage.episodeMetaBytes,
+    maxSingleDoMetaAt25kBytes,
+    gates: evaluateCmsGates({
+      invariants,
+      editP95Ms: percentile(lats, 95),
+      editMetaBytes: storage.episodeMetaBytes,
+      maxSingleDoMetaAt25kBytes,
+    }),
+  };
+  return { result, storage, contention };
+};
+
+// ---------------------------------------------------------------------------
 // Main scorecard output
 // ---------------------------------------------------------------------------
 
@@ -1779,63 +2111,66 @@ const main = async () => {
 
   try {
     const runId = Date.now().toString(36);
-    console.log("\nRunning Dynamic Ad Network candidates against real local workerd DOs...");
-    const rowMarket = await runSingleMarketFamilyOnWorkerd(
-      "Topology A: Market (+ Policy)",
-      "/market",
-      runId,
-      burstTape,
-      exhaustionTape,
-      skewedTape,
-      stMarket,
-    );
-    const rowCampaign = await runCampaignTopologyOnWorkerd(
-      runId,
-      burstTape,
-      exhaustionTape,
-      skewedTape,
-      stCampaign,
-    );
-    const rowCampaignDecision = await runCampaignTopologyOnWorkerd(
-      runId,
-      burstTape,
-      exhaustionTape,
-      skewedTape,
-      stCampaignDecision,
-      "decision",
-    );
-    const rowEscrow = await runEscrowTopologyOnWorkerd(
-      runId,
-      burstTape,
-      exhaustionTape,
-      skewedTape,
-      stEscrow,
-    );
-
-    const quotaRows: ReadonlyArray<WorkerdQuotaRow> = [
-      { name: "MockQuotaReference (in-memory)", ...mockQuota },
-      rowMarket,
-      rowCampaign,
-      rowEscrow,
-      rowCampaignDecision,
-    ];
-
-    console.log("\n### 1. Dynamic Ad Network — Falsifiable Scorecard");
-    console.log(
-      `Gates: Burst p95 <= ${QUOTA_GATES.burstP95MaxMs} ms & wall <= ${QUOTA_GATES.burstMaxWallMs} ms | Skewed fill >= ${(QUOTA_GATES.minFillRate * 100).toFixed(0)}% | Exhaustion exact 40/40 + dedupe + invoice | Storage <= ${QUOTA_GATES.maxStoredBytesPerOpp} B/opp & <= ${QUOTA_GATES.maxPutKeysPerOpp} putKeys/opp\n`,
-    );
-    console.log(
-      "| Candidate | Burst Wall | Burst p95 | Skew Fill | Exhaustion (A cred/del/ex, inv) | PutKeys/opp | Stored B/opp (→10GB @3.5M/mo) | Verdict |",
-    );
-    console.log("|---|---:|---:|---:|---|---:|---:|---|");
-    for (const r of quotaRows) {
-      const exStr =
-        r.exhaustion.totalOpportunities > 0 && r.exhaustion.totalFilled > 0
-          ? `${r.exhaustion.sponsorACredited}/${r.exhaustion.sponsorATarget} (del ${r.exhaustion.sponsorADelivered}, ex ${r.exhaustion.sponsorAExcess}, dup ${r.exhaustion.duplicateDoubleCounted}, inv ${r.exhaustion.invoiceFinalized ? "ok" : "no"})`
-          : "N/A (no global ledger)";
-      console.log(
-        `| ${r.name} | ${r.burst.wallMs.toFixed(0)} ms | ${r.burst.p95Ms.toFixed(1)} ms | ${(r.skewed.fillRate * 100).toFixed(1)}% (${r.skewed.stranded} str.) | ${exStr} | ${r.storage.putKeysPerOpp.toFixed(2)} | ${r.storage.storedBytesPerOpp.toFixed(0)} B (${fmtDays(r.storage.daysTo10GbAt3_5MPerMonth)}) | **${badge(r.gates.allPassed)}** |`,
+    // BENCH_ONLY=cms skips the ad network workerd runs (the slow half).
+    if (process.env.BENCH_ONLY !== "cms") {
+      console.log("\nRunning Dynamic Ad Network candidates against real local workerd DOs...");
+      const rowMarket = await runSingleMarketFamilyOnWorkerd(
+        "Topology A: Market (+ Policy)",
+        "/market",
+        runId,
+        burstTape,
+        exhaustionTape,
+        skewedTape,
+        stMarket,
       );
+      const rowCampaign = await runCampaignTopologyOnWorkerd(
+        runId,
+        burstTape,
+        exhaustionTape,
+        skewedTape,
+        stCampaign,
+      );
+      const rowCampaignDecision = await runCampaignTopologyOnWorkerd(
+        runId,
+        burstTape,
+        exhaustionTape,
+        skewedTape,
+        stCampaignDecision,
+        "decision",
+      );
+      const rowEscrow = await runEscrowTopologyOnWorkerd(
+        runId,
+        burstTape,
+        exhaustionTape,
+        skewedTape,
+        stEscrow,
+      );
+
+      const quotaRows: ReadonlyArray<WorkerdQuotaRow> = [
+        { name: "MockQuotaReference (in-memory)", ...mockQuota },
+        rowMarket,
+        rowCampaign,
+        rowEscrow,
+        rowCampaignDecision,
+      ];
+
+      console.log("\n### 1. Dynamic Ad Network — Falsifiable Scorecard");
+      console.log(
+        `Gates: Burst p95 <= ${QUOTA_GATES.burstP95MaxMs} ms & wall <= ${QUOTA_GATES.burstMaxWallMs} ms | Skewed fill >= ${(QUOTA_GATES.minFillRate * 100).toFixed(0)}% | Exhaustion exact 40/40 + dedupe + invoice | Storage <= ${QUOTA_GATES.maxStoredBytesPerOpp} B/opp & <= ${QUOTA_GATES.maxPutKeysPerOpp} putKeys/opp\n`,
+      );
+      console.log(
+        "| Candidate | Burst Wall | Burst p95 | Skew Fill | Exhaustion (A cred/del/ex, inv) | PutKeys/opp | Stored B/opp (→10GB @3.5M/mo) | Verdict |",
+      );
+      console.log("|---|---:|---:|---:|---|---:|---:|---|");
+      for (const r of quotaRows) {
+        const exStr =
+          r.exhaustion.totalOpportunities > 0 && r.exhaustion.totalFilled > 0
+            ? `${r.exhaustion.sponsorACredited}/${r.exhaustion.sponsorATarget} (del ${r.exhaustion.sponsorADelivered}, ex ${r.exhaustion.sponsorAExcess}, dup ${r.exhaustion.duplicateDoubleCounted}, inv ${r.exhaustion.invoiceFinalized ? "ok" : "no"})`
+            : "N/A (no global ledger)";
+        console.log(
+          `| ${r.name} | ${r.burst.wallMs.toFixed(0)} ms | ${r.burst.p95Ms.toFixed(1)} ms | ${(r.skewed.fillRate * 100).toFixed(1)}% (${r.skewed.stranded} str.) | ${exStr} | ${r.storage.putKeysPerOpp.toFixed(2)} | ${r.storage.storedBytesPerOpp.toFixed(0)} B (${fmtDays(r.storage.daysTo10GbAt3_5MPerMonth)}) | **${badge(r.gates.allPassed)}** |`,
+        );
+      }
     }
 
     console.log(
@@ -1843,11 +2178,13 @@ const main = async () => {
     );
     const cms = await runCmsCandidatesOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
     const dec = await runDecisionCmsOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
+    const con = await runContentDomainOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
     const cmsRows: ReadonlyArray<{ readonly name: string; readonly res: CmsBenchmarkResult }> = [
       { name: "MockCmsReference (in-memory, 25k docs)", res: mockCms },
       { name: "Monolith Workspace DO", res: cms.monolithResult },
       { name: "Naive Split ContentDocument DO", res: cms.splitResult },
       { name: "Topology E: Per-Doc Aggregates + Decision", res: dec.result },
+      { name: "Topology F: Content Domain (4 of 8 restated)", res: con.result },
     ];
 
     console.log("\n### 2. Podcast Network CMS (25,000 Docs) — Falsifiable Scorecard");
@@ -1886,6 +2223,28 @@ const main = async () => {
     for (let i = 0; i < dec.contention.autosave.length; i++) {
       const a = dec.contention.autosave[i]!;
       const b = dec.contention.addReference[i]!;
+      console.log(
+        `| ${a.concurrency} | ${a.p50Ms.toFixed(0)} / ${a.p95Ms.toFixed(0)} / ${a.maxMs.toFixed(0)} ms | ${a.failed}/${a.total} | ${b.p50Ms.toFixed(0)} / ${b.p95Ms.toFixed(0)} / ${b.maxMs.toFixed(0)} ms | ${b.failed}/${b.total} |`,
+      );
+    }
+    const cs = con.storage;
+    console.log("\nTopology F (content domain) at 25,000 docs:");
+    console.log(
+      `  - Instances: ${cs.instanceCounts.shows} Show, ${cs.instanceCounts.episodes.toLocaleString()} Episode, ${cs.instanceCounts.audioMasters.toLocaleString()} AudioMaster, ${cs.instanceCounts.libraryItems.toLocaleString()} LibraryItem (+ one ShowHandle per show)`,
+    );
+    console.log(
+      `  - Heaviest Show (${cs.hotShowEpisodeCount} episodes in its schedule): ${fmtSize(cs.hotShowMetaBytes)}; episode: ${fmtSize(cs.episodeMetaBytes)}; audio master: ${fmtSize(cs.masterMetaBytes)}; segment: ${fmtSize(cs.segmentMetaBytes)}`,
+    );
+    console.log(
+      "\nTopology F contention around one hot show (K concurrent commands, 3 rounds each):",
+    );
+    console.log(
+      "| K | (a) autosave (plain command): p50 / p95 / max | failed | (b) schedule a new episode into the show: p50 / p95 / max | failed |",
+    );
+    console.log("|---:|---:|---:|---:|---:|");
+    for (let i = 0; i < con.contention.autosave.length; i++) {
+      const a = con.contention.autosave[i]!;
+      const b = con.contention.schedule[i]!;
       console.log(
         `| ${a.concurrency} | ${a.p50Ms.toFixed(0)} / ${a.p95Ms.toFixed(0)} / ${a.maxMs.toFixed(0)} ms | ${a.failed}/${a.total} | ${b.p50Ms.toFixed(0)} / ${b.p95Ms.toFixed(0)} / ${b.maxMs.toFixed(0)} ms | ${b.failed}/${b.total} |`,
       );

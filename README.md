@@ -25,6 +25,7 @@ pnpm install
 pnpm typecheck
 pnpm test            # Story tests + Decision model tests + 25k-doc oracle tests + local DO tests
 pnpm bench:eval      # Falsifiable scorecard (oracle vs. each modeling attempt) on local workerd
+BENCH_ONLY=cms pnpm bench:eval   # CMS models only (skips the slow ad network runs)
 pnpm bench:workerd   # Focused real local workerd DO load probe
 pnpm bench:quota     # DO key-prefix & storage breakdown (Ads)
 pnpm bench:cms       # DO "meta" size scaling from 100 -> 25,000 CMS docs
@@ -86,17 +87,17 @@ And one property of `keyOf`: **it sees only the command.** Instances that follow
 
 | Model | Burst Wall | Burst p95 | Skew Fill | Exhaustion (A cred/del/ex, inv) | PutKeys/opp | Stored B/opp (→10GB @3.5M/mo) | Verdict |
 |---|---:|---:|---:|---|---:|---:|---|
-| **Oracle** *(in-memory)* | 31 ms | 0.0 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 0.00 | 0 B (∞) | **PASS** |
-| **Topology A: `Market` (+ Policy)** | 92,938 ms | 91,913.5 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 27.29 | 3,628 B (25d) | **FAIL** |
-| **Topology B: Per-`Campaign` DOs** | 15,127 ms | 13,850.3 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 12.10 | 2,199 B (42d) | **FAIL** |
-| **Topology C: 8 `AllocationCell` DOs** | 7,932 ms | 5,654.8 ms | **62.5% (90 str.)** | N/A (no global ledger) | 12.43 | 2,424 B (299d) | **FAIL** |
-| **Topology D: Per-`Campaign` + `Decision`** | 154,830 ms | 145,508.8 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 25.16 | 2,292 B (40d) | **FAIL** |
+| **Oracle** *(in-memory)* | 100 ms | 0.0 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 0.00 | 0 B (∞) | **PASS** |
+| **Topology A: `Market` (+ Policy)** | 87,628 ms | 86,686.0 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 27.29 | 3,628 B (25d) | **FAIL** |
+| **Topology B: Per-`Campaign` DOs** | 14,905 ms | 13,003.1 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 12.10 | 2,199 B (42d) | **FAIL** |
+| **Topology C: 8 `AllocationCell` DOs** | 11,811 ms | 9,784.2 ms | **62.5% (90 str.)** | N/A (no global ledger) | 12.43 | 2,424 B (299d) | **FAIL** |
+| **Topology D: Per-`Campaign` + `Decision`** | 153,671 ms | 144,541.4 ms | 100.0% (0 str.) | 40/40 (del 40, ex 0, dup 0, inv ok) | 25.16 | 2,292 B (40d) | **FAIL** |
 
 ### What This Shows
 
-1. **The model that keeps every invariant correct (Topology A) can't keep up.** It is exact on accuracy, dedupe, and invoicing, but a per-reservation `schedule` policy plus one command per opportunity and per exposure queues the 3 s burst into a **~92 s p95**. It writes **~27 storage keys per opportunity**, which fills a 10 GB DO in **~25 days** at 3.5M opps/mo (~2.5 days at 10×).
+1. **The model that keeps every invariant correct (Topology A) can't keep up.** It is exact on accuracy, dedupe, and invoicing, but a per-reservation `schedule` policy plus one command per opportunity and per exposure queues the 3 s burst into a **~87 s p95**. It writes **~27 storage keys per opportunity**, which fills a 10 GB DO in **~25 days** at 3.5M opps/mo (~2.5 days at 10×).
 2. **Splitting the aggregate trades correctness for throughput, and still isn't fast enough.** Per-campaign DOs (B) give up atomic cross-campaign selection. Sharded cells (C) strand **37.5%** of a tight budget under skew and lose the global ledger. Both remain multi-second at p95, at ~12 puts/opp.
-3. **`Domain.Decision` gives back atomic selection (D), at the cost of making every campaign hot.** D is exactly as correct as A, and its stored bytes per opportunity are close to B's. But weighted selection must see every candidate, so every opportunity's decision reads, prepares and holds **all** candidate campaigns. Concurrent opportunities contend on the same set and abort and retry, and the burst p95 is **~146 s**, worse than the single `Market`. Two-phase commit also doubles writes per opportunity (**25 puts/opp** vs 12 for B). The hot spot moved from one aggregate to "every aggregate, all at once".
+3. **`Domain.Decision` gives back atomic selection (D), at the cost of making every campaign hot.** D is exactly as correct as A, and its stored bytes per opportunity are close to B's. But weighted selection must see every candidate, so every opportunity's decision reads, prepares and holds **all** candidate campaigns. Concurrent opportunities contend on the same set and abort and retry, and the burst p95 is **~145 s**, worse than the single `Market`. Two-phase commit also doubles writes per opportunity (**25 puts/opp** vs 12 for B). The hot spot moved from one aggregate to "every aggregate, all at once".
 4. **Framework bookkeeping dominates storage even with pruned user state.** With user `"meta"` held under ~1 KiB, `event:*`, `receipt:*`, `seen:*`, `armed:*`, `scheduled:*`, `cb:*` (and, for decisions, two-phase-commit) keys still grow monotonically per command (see `pnpm bench:quota` for the per-prefix breakdown).
 
 *(A separate test of raw SQLite DOs on real Cloudflare found that synchronous per-opportunity DO admission reached **4,096 ms p95** under peak bursts.)*
@@ -126,10 +127,13 @@ A toy 3-type CMS hides where things break at scale, so the corpus models a reali
 |---|---|---|
 | **Oracle** | In-memory indexed ([mock-baselines.ts](apps/repro-worker/benchmarks/mock-baselines.ts)) | Passes all 8 invariants at full corpus scale. |
 | **Monolith `Workspace` DO** | 1 DO holds every `DocumentMeta` in KV `"meta"` ([Workspace.aggregate.ts](packages/cms-domain/src/Workspace/Workspace.aggregate.ts)) | Enforces 8/8 invariants atomically, but `"meta"` reaches **1.82 MiB at just 2,500 docs** and **18.84 MiB at 25,000 docs (942% of Cloudflare's 2 MiB value cap)**. |
-| **Naive split `ContentDocument` DO** | 1 DO per document, plain commands ([Document.aggregate.ts](packages/cms-domain/src/Document/Document.aggregate.ts)) | Small `"meta"` and the fastest edits, but can only enforce **1/8** invariants locally. |
-| **Topology E: per-document aggregates + `Decision`** | `CmsDocument(docId)`, `UniqueClaim(value)`, `InboundRefs(docId)`, `SegmentEpisodes(segmentId)`, and one decision per command ([Decision/](packages/cms-domain/src/Decision/)) | **8/8 invariants** with **no instance above 1.1 KiB** at 25,000 docs. Each command reads the instances it affects and commits on all of them atomically. No sagas. |
+| **Naive split `ContentDocument` DO** | 1 DO per document, plain commands ([Document.aggregate.ts](packages/cms-domain/src/Document/Document.aggregate.ts)) | Small `"meta"` and fast edits, but can only enforce **1/8** invariants locally. |
+| **Topology E: per-document aggregates + `Decision`** | `CmsDocument(docId)`, `UniqueClaim(value)`, `InboundRefs(docId)`, `SegmentEpisodes(segmentId)`, and one decision per command ([Decision/](packages/cms-domain/src/Decision/)) | **8/8 invariants** with **no instance above 1.1 KiB**, but every save is a distributed transaction. |
+| **Topology F: the content domain** | `Show`, `ShowHandle`, `Episode`, `AudioMaster`, `LibraryItem`, with decisions only for naming a show, scheduling an episode and publishing ([Content/](packages/cms-domain/src/Content/)) | **8/8**, with **4 invariants restated** as content rules; autosaves are plain single-aggregate commands; no instance above 1.5 KiB. |
 
-Topology E gives every invariant an aggregate keyed by what it protects, the pattern the `alchemy-domain` skill recommends for "a rule about several things at once":
+#### Topology E: the CMS's model, made atomic
+
+E keeps the CMS's own model (documents with typed strong references) and gives every invariant an aggregate keyed by what it protects, the pattern the `alchemy-domain` skill recommends for "a rule about several things at once":
 
 - **Slugs and dates (2, 3):** one `UniqueClaim` per unique value (`show-slug:partner:daily`, `episode-slug:<showId>:<slug>`, `episode-date:<showId>:<date>`), so no index grows with the corpus.
 - **References (4, 5):** a save reads the documents it newly references (do they exist?) and records on their `InboundRefs`; a delete is refused while its own `InboundRefs` is non-empty.
@@ -138,7 +142,32 @@ Topology E gives every invariant an aggregate keyed by what it protects, the pat
 - **Steelmanned:** a save reads only what it *changes* relative to what the caller last saw. A reference the document already holds can't have been deleted since (delete-in-use forbids it), and a claim it already holds is still its own. A single-field autosave of a document without `clipOnlyMode` reads only itself. The benchmark episode has `clipOnlyMode` on, so its autosave reads **5** instances, including the partner show and the audio master that rule re-checks.
 - **The `keyOf` cost:** each command carries an `observed` block (the claims, references and segment index the caller last read). The decision refuses with `StaleRead` if it needed an instance the caller didn't name, and the caller re-reads and retries. The [DecisionCms client](packages/cms-domain/src/Decision/DecisionCms.client.ts) does that read-then-send.
 
-Its behavior is specified in [DecisionCms.test.ts](packages/cms-domain/test/DecisionCms.test.ts), in memory, and probed with the same 8 checks as the monolith on `workerd`.
+Specified in [DecisionCms.test.ts](packages/cms-domain/test/DecisionCms.test.ts).
+
+#### Topology F: the content domain itself
+
+E, like every model before it, treats the podcast network the way a CMS does: as documents that reference each other. F models what the network is about instead, and puts each rule with what owns it:
+
+- **`Show`** owns its schedule: the episode slugs and release dates taken within it.
+- **`ShowHandle`** is a show's public slug, unique per ownership type.
+- **`Episode`** owns its draft. An editor's autosave (`EditEpisodeDraft`) is a plain command on one aggregate.
+- **`AudioMaster`** and **`LibraryItem`** (segments, hosts, tags, links, media, channel welcomes) are content an episode uses.
+- **Decisions** run only where a rule genuinely spans aggregates: `ShowNaming` (a show and its handle), `Scheduling` (an episode and the shows it joins or leaves) and `EpisodePublication` (an episode, its audio master, its shows and its library content).
+
+Four of the eight invariants are kept exactly. The other four are restated as rules about content rather than about references, which is a change to the requirements, not only to the model:
+
+| # | Invariant | In Topology F |
+|---|---|---|
+| 1 | Optimistic concurrency | **Kept.** `expectedRevision` on every aggregate. |
+| 2 | Show slug unique per ownership type | **Kept.** `ShowHandle`, taken and released by `ShowNaming`. |
+| 3 | Episode slug and date unique within every owning show | **Kept.** The show's own schedule, updated by `Scheduling` on every show the episode joins or leaves. |
+| 4 | No dangling strong references | **Restated:** a draft may reference anything; an episode can't *publish* against content that doesn't exist. |
+| 5 | No deleting content in use | **Restated:** content is never hard-deleted. Retiring is always allowed, and an episode can't publish against retired content. Published episodes keep what they published. |
+| 6 | Publish needs a published, playable audio master | **Kept.** Checked by `EpisodePublication`. |
+| 7 | `clipOnlyMode` needs a partner show and one valid highlight | **Restated (timing):** checked when the episode publishes, not on every edit. |
+| 8 | Atomic multi-document publish; tags cascade from a segment | **8a kept:** an episode publishes with its audio master in one step. **8b restated:** an episode's tags come from its primary segment when it's read, so a segment edit is one write instead of a cascade. |
+
+Two consequences of the restatements: show and audio master references (a show's hosts, an audio master's segments) aren't checked by any rule, because only episodes publish here; and an episode's stored `tagIds` are only used when it has no primary segment. Specified in [Content.test.ts](packages/cms-domain/test/Content.test.ts); probed on `workerd` with the same 8 checks as the other models, with the restated ones checking the restated rule (for example, invariant 5 checks that retiring succeeds and that a later publish against the retired asset is refused).
 
 ### Scorecard (`pnpm bench:eval`, real local `workerd` DOs + 25,000-doc SQLite DO probes)
 
@@ -147,28 +176,40 @@ Its behavior is specified in [DecisionCms.test.ts](packages/cms-domain/test/Deci
 | Model | Invariants | Edit p50 | Edit p95 | Edit `meta` | Max DO `meta` @25,000 docs | % of 2 MiB DO cap | Verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
 | **Oracle** *(in-memory, 25k docs)* | 8/8 | 0.0 ms | 0.0 ms | 0.6 KiB | 0.6 KiB | 0.0% | **PASS** |
-| **Monolith `Workspace` DO** | 8/8 | 150.9 ms | 226.6 ms | 384.4 KiB *(500-doc slice)* | **18.84 MiB** | **942.2%** | **FAIL** |
-| **Naive split `ContentDocument` DO** | **1/8** | 26.5 ms | 45.9 ms | 0.3 KiB | 0.3 KiB | 0.0% | **FAIL** |
-| **Topology E: Per-Doc + `Decision`** | **8/8** | 331.7 ms | 443.8 ms | 0.9 KiB | **1.1 KiB** | **0.1%** | **FAIL** *(latency)* |
+| **Monolith `Workspace` DO** | 8/8 | 142.4 ms | 173.6 ms | 384.4 KiB *(500-doc slice)* | **18.84 MiB** | **942.2%** | **FAIL** |
+| **Naive split `ContentDocument` DO** | **1/8** | 10.7 ms | 14.0 ms | 0.3 KiB | 0.3 KiB | 0.0% | **FAIL** |
+| **Topology E: Per-Doc + `Decision`** | **8/8** | 215.0 ms | 227.8 ms | 0.9 KiB | **1.1 KiB** | **0.1%** | **FAIL** *(latency)* |
+| **Topology F: Content domain** | **8/8** *(4 restated)* | 11.4 ms | 12.0 ms | 0.4 KiB | **1.5 KiB** | **0.1%** | **PASS** *(on restated rules)* |
 
-Topology E at 25,000 documents: `25,000` `CmsDocument`, `17,520` `UniqueClaim`, `16,423` `InboundRefs` and `4,500` `SegmentEpisodes` instances. The heaviest `InboundRefs` (a `taxonomyTag` with 69 referrers) is **1.1 KiB**; the busiest `SegmentEpisodes` is 0.1 KiB.
+*(The CMS numbers come from one `BENCH_ONLY=cms pnpm bench:eval` run, so every CMS model shares the same machine load; the ad network numbers come from the preceding full run of the same code.)*
 
-**Contention around one hot target.** K documents saved at once, all involving the same `host` (3 rounds per K):
+At 25,000 documents, E has `25,000` `CmsDocument`, `17,520` `UniqueClaim`, `16,423` `InboundRefs` and `4,500` `SegmentEpisodes` instances; its heaviest is an `InboundRefs` (a `taxonomyTag` with 69 referrers) at **1.1 KiB**. F has `350` `Show`, `7,500` `Episode`, `5,000` `AudioMaster` and `12,150` `LibraryItem` instances, plus a `ShowHandle` per show; its heaviest is the busiest show's schedule (30 episodes) at **1.5 KiB**.
+
+**Contention, Topology E.** K documents saved at once, all involving the same `host` (3 rounds per K):
 
 | K | (a) Autosave; refs unchanged, host not read: p50 / p95 / max | failed | (b) New episode adds a ref to the host: p50 / p95 / max | failed |
 |---:|---:|---:|---:|---:|
-| 1 | 171 / 228 / 228 ms | 0/3 | 253 / 288 / 288 ms | 0/3 |
-| 8 | 700 / 710 / 711 ms | 0/24 | 1,557 / 2,806 / 2,835 ms | 0/24 |
-| 32 | 2,537 / 2,643 / 2,643 ms | 0/96 | 6,740 / 11,554 / 11,902 ms | 0/96 |
+| 1 | 91 / 97 / 97 ms | 0/3 | 167 / 169 / 169 ms | 0/3 |
+| 8 | 408 / 439 / 439 ms | 0/24 | 941 / 1,645 / 1,779 ms | 0/24 |
+| 32 | 1,394 / 1,408 / 1,408 ms | 0/96 | 3,997 / 7,251 / 7,470 ms | 0/96 |
 
-Column (a) shares no instances, so it measures local `workerd` under load. Column (b) adds what holding the same two instances (`CmsDocument(host)` and `InboundRefs(host)`) costs: at K = 32, p95 is **~4.4×** higher.
+**Contention, Topology F.** K commands at once around the same show (3 rounds per K):
+
+| K | (a) Autosave, a plain command on each episode: p50 / p95 / max | failed | (b) Schedule a new episode into the show: p50 / p95 / max | failed |
+|---:|---:|---:|---:|---:|
+| 1 | 12 / 61 / 61 ms | 0/3 | 147 / 185 / 185 ms | 0/3 |
+| 8 | 64 / 6,466 / 6,466 ms | 0/24 | 1,283 / 1,845 / 1,913 ms | 0/24 |
+| 32 | 432 / 467 / 467 ms | 0/96 | 14,773 / 18,631 / 18,931 ms | 0/96 |
+
+Columns (a) share no instances, so they measure local `workerd` under load. F's (a) at K = 8 has a 6.5 s outlier against a 64 ms median, which this run doesn't explain. Columns (b) add what holding the same instances costs: in E, the host's `CmsDocument` and `InboundRefs`; in F, the show itself, which every scheduling decision records on.
 
 ### What This Shows
 
-1. **`Domain.Decision` removes the monolith's state-size wall.** 8/8 invariants hold with every instance at about 1 KiB, versus 18.84 MiB in one `"meta"` value. Atomic publish and cascades need no sagas.
-2. **A single-field edit now costs a distributed transaction.** Even a decision that reads only its own document takes ~170 ms locally, versus ~27 ms for the same edit as a plain aggregate command. The benchmark episode's autosave (5 instances) takes 332 ms p50 / 444 ms p95. Prepares run one after another, so latency scales with the instances read.
-3. **Popular documents become contention points.** Every save that adds or removes a reference to a popular target (a host, tag or show) prepares and holds that target's `InboundRefs`, and its `CmsDocument` when the reference is new. Concurrent writers to the same target serialize through abort-and-retry.
-4. **The caller has to know the aggregate's state.** Because `keyOf` sees only the command, renames, reference changes, deletes and cascades need a read before the send, plus a `StaleRead` retry path for when that read goes stale.
+1. **`Domain.Decision` removes the monolith's state-size wall.** E holds all 8 invariants with every instance at about 1 KiB, versus 18.84 MiB in one `"meta"` value. Atomic publish and cascades need no sagas.
+2. **Applied to the CMS's model, every edit becomes a distributed transaction.** Even a decision that reads only its own document takes ~90–170 ms locally, against ~11 ms for the same edit as a plain command; E's benchmark autosave (5 instances) takes 215 ms p50 / 228 ms p95. Prepares run one after another, so latency scales with the instances read.
+3. **Modeling the content domain moves Decision to where rules really span aggregates.** In F, editing is a plain command (11.4 ms p50 / 12.0 ms p95, under the 30 ms gate), and decisions run only when a show is named, an episode is scheduled or published. F passes every gate, but on four restated invariants, which are a product decision as much as a modeling one.
+4. **Contention follows the rule's owner.** In E, popular *referenced* documents (a host, tag or show) are contended by every save that starts or stops referencing them. In F, a show is contended only by episodes being scheduled into it at the same moment: realistic for a bulk import (18.6 s p95 at K = 32), rare for editors.
+5. **The caller has to know the aggregate's state.** Because `keyOf` sees only the command, E's renames, reference changes, deletes and cascades, and F's scheduling and publishing, read before they send and check that read is still current.
 
 ---
 
@@ -178,4 +219,5 @@ Column (a) shares no instances, so it measures local `workerd` under load. Colum
 2. **Participant fan-out:** prepares run sequentially. Is that a correctness requirement (deadlock avoidance through stream order), or could prepares to distinct instances run concurrently?
 3. **`keyOf` from state:** is there an idiomatic way to involve instances that depend on an aggregate's current state (its claims, its outgoing references) without the caller naming them and the decision validating them (the `observed` + `StaleRead` pattern here)?
 4. **High-throughput shared quota (Ads):** when every request must atomically choose among, and decrement, a small shared set of budgets at hundreds of requests per second, neither one aggregate (A), independent aggregates (B, C), nor a decision over all of them (D) keeps up. What is the recommended boundary?
-5. **Framework key retention and compaction:** even with pruned user state, `event:*`, `receipt:*`, `seen:*`, `armed:*`, `scheduled:*`, and `cb:*` keys grow monotonically (~27 puts/opp in Topology A with its policy; ~12 in Topology B without one; ~25 with a decision). Are snapshot compaction, `receipt:*` TTLs, or retention policies planned, so high-volume aggregates don't hit Cloudflare's 10 GB DO limit?
+5. **Domain model vs. CMS model:** Topology F passes by modeling shows, episodes and content directly, and by restating four CMS invariants as content rules (retire instead of delete, check references and `clipOnlyMode` at publish, derive tags when read). Is that the shape you'd recommend for `@alchemy.run/domain`, and are those restatements the ones you'd expect a domain model to make?
+6. **Framework key retention and compaction:** even with pruned user state, `event:*`, `receipt:*`, `seen:*`, `armed:*`, `scheduled:*`, and `cb:*` keys grow monotonically (~27 puts/opp in Topology A with its policy; ~12 in Topology B without one; ~25 with a decision). Are snapshot compaction, `receipt:*` TTLs, or retention policies planned, so high-volume aggregates don't hit Cloudflare's 10 GB DO limit?
