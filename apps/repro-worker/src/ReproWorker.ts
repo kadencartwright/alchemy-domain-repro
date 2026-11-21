@@ -4,7 +4,9 @@ import { ContentDocument, SplitDocumentCms } from "@repro/cms-domain/Document/Do
 import { SaveDocumentDraft } from "@repro/cms-domain/Document/Document.commands";
 import { RetireLibraryItem, SaveLibraryItem } from "@repro/cms-domain/Content/Content.aggregates";
 import { ContentClient, ContentSeeder } from "@repro/cms-domain/Content/Content.client";
-import { ContentDomain } from "@repro/cms-domain/Content/Content.model";
+import type { EpisodePatch } from "@repro/cms-domain/Content/Content.aggregates";
+import { EpisodeHistory } from "@repro/cms-domain/Content/Content.history";
+import { ContentDomain, ContentDomainHandlers } from "@repro/cms-domain/Content/Content.model";
 import {
   DecisionCmsClient,
   type Draft,
@@ -78,7 +80,7 @@ const ModelsLive = Layer.mergeAll(
   }),
   SplitDocumentCms.layer(Layer.empty, { legacyData: false }),
   DecisionCms.layer(Layer.empty, { legacyData: false }),
-  ContentDomain.layer(Layer.empty, { legacyData: false }),
+  ContentDomain.layer(ContentDomainHandlers, { legacyData: false }),
 ).pipe(Layer.provide(PlatformLive));
 
 /**
@@ -105,6 +107,7 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
     const decisionCms = yield* DecisionCmsClient;
     const seedDecisionCms = yield* DecisionCmsSeeder;
     const content = yield* ContentClient;
+    const historyProgress = yield* EpisodeHistory.Progress;
     const seedContent = yield* ContentSeeder;
 
     const handle = Effect.gen(function* () {
@@ -573,6 +576,20 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
         const toIds = (arr: unknown): Array<DocumentId> =>
           Array.isArray(arr) ? arr.map((id) => DocumentId.make(String(id))) : [];
         const options = body.commandId ? { commandId: String(body.commandId) } : undefined;
+        /** An autosave's changed fields, with their ids branded. */
+        const toPatch = (changes: Record<string, unknown>): EpisodePatch => {
+          const out: Record<string, unknown> = { ...changes };
+          for (const f of ["segmentIds", "hostIds", "managedLinkIds", "mediaAssetIds"]) {
+            if (f in changes) out[f] = toIds(changes[f]);
+          }
+          if ("audioMasterId" in changes) {
+            out.audioMasterId =
+              changes.audioMasterId === null
+                ? null
+                : DocumentId.make(String(changes.audioMasterId));
+          }
+          return out as EpisodePatch;
+        };
         const respond = <A, E extends { readonly _tag: string }>(effect: Effect.Effect<A, E>) =>
           effect.pipe(
             Effect.flatMap((receipt) => HttpServerResponse.json({ ok: true, receipt })),
@@ -589,24 +606,16 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
           }).pipe(Effect.orDie);
           return yield* HttpServerResponse.json({ ok: true, counts });
         }
+        // An autosave: only the changed fields. With `basedOn`, the field revisions
+        // the editor last saw; without it, the editor has seen the episode as it is now.
         if (url.pathname === "/cms/content/edit") {
+          const episodeId = DocumentId.make(body.episodeId);
+          const changes = toPatch(body.changes ?? {});
+          const editor = body.editor ?? "editor";
           return yield* respond(
-            content.edit(
-              {
-                episodeId: DocumentId.make(body.episodeId),
-                expectedRevision: body.expectedRevision ?? null,
-                title: body.title,
-                bodyHash: body.bodyHash ?? "sha256:0",
-                closerKind: body.closerKind ?? "none",
-                clipOnlyMode: body.clipOnlyMode ?? false,
-                audioMasterId: body.audioMasterId ? DocumentId.make(body.audioMasterId) : null,
-                segmentIds: toIds(body.segmentIds),
-                hostIds: toIds(body.hostIds),
-                managedLinkIds: toIds(body.managedLinkIds),
-                mediaAssetIds: toIds(body.mediaAssetIds),
-              },
-              options,
-            ),
+            body.basedOn === undefined
+              ? content.edit(episodeId, changes, editor, options)
+              : content.save(episodeId, editor, changes, body.basedOn, options),
           );
         }
         if (url.pathname === "/cms/content/save-show") {
@@ -638,7 +647,10 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
           return yield* respond(
             content.publish(
               DocumentId.make(body.episodeId),
-              body.publishAudioMaster ?? false,
+              {
+                ...(body.reviewed === undefined ? {} : { reviewed: body.reviewed }),
+                publishAudioMaster: body.publishAudioMaster ?? false,
+              },
               options,
             ),
           );
@@ -663,6 +675,48 @@ export default class ReproWorker extends Cloudflare.Worker<ReproWorker>()(
               options,
             ),
           );
+        }
+        // Requirement 9: revision history.
+        if (url.pathname === "/cms/content/history") {
+          const page = yield* content.history(DocumentId.make(body.episodeId), {
+            take: body.take,
+            after: body.after,
+          });
+          return yield* HttpServerResponse.json({ ok: true, page });
+        }
+        if (url.pathname === "/cms/content/revision") {
+          const found = yield* content.contentAt(DocumentId.make(body.episodeId), body.revision);
+          return yield* HttpServerResponse.json({
+            ok: true,
+            content: found._tag === "Some" ? found.value : null,
+          });
+        }
+        if (url.pathname === "/cms/content/restore") {
+          return yield* respond(
+            content
+              .restore(
+                DocumentId.make(body.episodeId),
+                body.revision,
+                body.editor ?? "editor",
+                options,
+              )
+              .pipe(
+                Effect.flatMap((found) =>
+                  found._tag === "Some"
+                    ? Effect.succeed(found.value)
+                    : Effect.fail({ _tag: "RevisionNotFound", revision: body.revision } as const),
+                ),
+              ),
+          );
+        }
+        if (url.pathname === "/cms/content/history-caught-up") {
+          const ok = yield* historyProgress
+            .caughtUp({ stream: body.stream, version: body.version }, { timeout: "30 seconds" })
+            .pipe(
+              Effect.as(true),
+              Effect.catch(() => Effect.succeed(false)),
+            );
+          return yield* HttpServerResponse.json({ ok });
         }
         if (url.pathname === "/cms/content/get-episode") {
           const episode = yield* content.episodes.get(DocumentId.make(body.episodeId));

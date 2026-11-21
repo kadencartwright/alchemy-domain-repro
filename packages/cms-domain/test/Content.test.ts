@@ -8,11 +8,14 @@ import {
   SaveAudioMaster,
   SaveLibraryItem,
 } from "../src/Content/Content.aggregates.ts";
-import { ContentClient, type EpisodeEdit } from "../src/Content/Content.client.ts";
-import { ContentDomain } from "../src/Content/Content.model.ts";
+import type { EpisodePatch } from "../src/Content/Content.aggregates.ts";
+import { ContentClient } from "../src/Content/Content.client.ts";
+import { ContentDomain, ContentDomainHandlers } from "../src/Content/Content.model.ts";
+import { EpisodeHistory } from "../src/Content/Content.history.ts";
 import { DocumentId } from "../src/Ids.ts";
+import * as Option from "effect/Option";
 
-const World = ContentDomain.layer(Layer.empty).pipe(Layer.provide(Domain.InMemory));
+const World = ContentDomain.layer(ContentDomainHandlers).pipe(Layer.provide(Domain.InMemory));
 const id = DocumentId.make;
 
 const seg1 = id("seg-opening");
@@ -27,8 +30,8 @@ const highlight = [
   { sectionType: "highlight" as const, startSec: 30, endSec: 60, lufs: -14 },
 ];
 
-const episode = (o: Partial<EpisodeEdit> & Pick<EpisodeEdit, "episodeId">): EpisodeEdit => ({
-  expectedRevision: null,
+/** A new episode's full content, as its first autosave. */
+const content = (o: EpisodePatch = {}): EpisodePatch => ({
   title: "Episode",
   bodyHash: "sha256:0",
   closerKind: "none",
@@ -86,24 +89,44 @@ const setUp = Effect.gen(function* () {
       chapters: highlight,
     }),
   );
-  yield* c.edit(episode({ episodeId: ep1, clipOnlyMode: true }));
+  yield* c.edit(ep1, content({ clipOnlyMode: true }));
   yield* c.schedule(ep1, [partner], "ep-001", "2026-11-23");
   return c;
 });
 
 describe("Topology F: the content domain", () => {
-  it.effect("keeps invariants 1, 2, 3, 6 and 8 as they are", () =>
+  it.effect("merges co-editors field by field and refuses only the stale field (invariant 1)", () =>
     Effect.gen(function* () {
       const c = yield* setUp;
-      // (1) stale revision on an autosave, a plain single-aggregate command
-      const autosave = yield* c.edit(
-        episode({ episodeId: ep1, clipOnlyMode: true, expectedRevision: 1, title: "Edited" }),
-      );
-      expect(autosave.stream).toBe(`Episode/${ep1}`);
-      const stale = yield* c
-        .edit(episode({ episodeId: ep1, expectedRevision: 7 }))
-        .pipe(Effect.flip);
-      expect(stale._tag).toBe("RevisionConflict");
+      // Alice and Bob both opened ep1 at revision 1: every field is at revision 1.
+      const seen = (yield* c.episodes.get(ep1))!.fieldRevisions;
+      const alice = yield* c.save(ep1, "alice", { title: "Alice's title" }, seen);
+      expect(alice.stream).toBe(`Episode/${ep1}`);
+      expect(alice.reply).toMatchObject({ revision: 2, skipped: [] });
+      // Bob's save to a different field merges.
+      const bob = yield* c.save(ep1, "bob", { bodyHash: "sha256:bob" }, seen);
+      expect(bob.reply).toMatchObject({ revision: 3, skipped: [] });
+      // Bob also changes the title, which Alice changed after he saw it: that field
+      // is skipped (he's shown hers), the rest of his save applies.
+      const mixed = yield* c.save(ep1, "bob", { title: "Bob's title", hostIds: [] }, seen);
+      expect(mixed.reply).toMatchObject({ revision: 4, skipped: ["title"] });
+      expect(yield* c.episodes.get(ep1)).toMatchObject({
+        title: "Alice's title",
+        bodyHash: "sha256:bob",
+        hostIds: [],
+      });
+      // A save whose every field is stale is refused.
+      const stale = yield* c.save(ep1, "bob", { title: "Bob again" }, seen).pipe(Effect.flip);
+      expect(stale).toMatchObject({
+        _tag: "FieldConflict",
+        fields: [{ field: "title", revision: 2 }],
+      });
+    }).pipe(Effect.provide(World)),
+  );
+
+  it.effect("keeps invariants 2, 3, 6 and 8, and publishes only the reviewed revision", () =>
+    Effect.gen(function* () {
+      const c = yield* setUp;
       // (2) show slugs are unique per ownership type ("daily" exists once in each)
       const dupShow = yield* c
         .saveShow({
@@ -116,7 +139,7 @@ describe("Topology F: the content domain", () => {
         .pipe(Effect.flip);
       expect(dupShow).toMatchObject({ _tag: "SlugConflict", conflictingDocumentId: internal });
       // (3) episode slug and date, per owning show: the show's own rule
-      yield* c.edit(episode({ episodeId: id("ep-2") }));
+      yield* c.edit(id("ep-2"), content());
       const dupSlug = yield* c.schedule(id("ep-2"), [partner], "ep-001", null).pipe(Effect.flip);
       expect(dupSlug).toMatchObject({ _tag: "SlugConflict", conflictingDocumentId: ep1 });
       const dupDate = yield* c
@@ -126,17 +149,29 @@ describe("Topology F: the content domain", () => {
       // ...and the same slug in a different show is fine
       yield* c.schedule(id("ep-2"), [internal], "ep-001", "2026-11-23");
       // (6) an unpublished audio master blocks publish
-      yield* c.edit(episode({ episodeId: id("ep-3"), audioMasterId: draftMaster }));
+      yield* c.edit(id("ep-3"), content({ audioMasterId: draftMaster }));
       yield* c.schedule(id("ep-3"), [internal], "ep-003", "2026-11-24");
       const notReady = yield* c.publish(id("ep-3")).pipe(Effect.flip);
       expect(notReady).toMatchObject({
         _tag: "PublishReadinessViolation",
         reason: "audio_master_unpublished",
       });
-      // (8) publishing it together with its audio master is one atomic step
-      const both = yield* c.publish(id("ep-3"), true);
+      // Publish names the revision the publisher reviewed. A co-editor saves in
+      // between: publishing the reviewed revision is refused, not overtaken.
+      const reviewed = (yield* c.episodes.get(id("ep-3")))!.revision;
+      yield* c.edit(id("ep-3"), { title: "A co-editor's half-finished title" });
+      const moved = yield* c
+        .publish(id("ep-3"), { reviewed, publishAudioMaster: true })
+        .pipe(Effect.flip);
+      expect(moved).toMatchObject({ _tag: "DraftMovedOn", reviewed, current: reviewed + 1 });
+      // (8) after re-review, the episode goes live together with its audio master
+      const both = yield* c.publish(id("ep-3"), {
+        reviewed: reviewed + 1,
+        publishAudioMaster: true,
+      });
       expect(both.commits.map((x) => x.stream)).toContain(`AudioMaster/${draftMaster}`);
       expect((yield* c.masters.get(draftMaster))?.published).toBe(true);
+      expect((yield* c.episodes.get(id("ep-3")))?.publishedRevision).toBe(reviewed + 1);
     }).pipe(Effect.provide(World)),
   );
 
@@ -144,7 +179,7 @@ describe("Topology F: the content domain", () => {
     Effect.gen(function* () {
       const c = yield* setUp;
       // (4) a missing reference is allowed while drafting, refused at publish
-      yield* c.edit(episode({ episodeId: id("ep-dangling"), mediaAssetIds: [id("missing")] }));
+      yield* c.edit(id("ep-dangling"), content({ mediaAssetIds: [id("missing")] }));
       const dangling = yield* c.publish(id("ep-dangling")).pipe(Effect.flip);
       expect(dangling).toMatchObject({
         _tag: "StrongReferenceViolation",
@@ -154,11 +189,9 @@ describe("Topology F: the content domain", () => {
       yield* c.library.send(new RetireLibraryItem({ itemId: host }));
       const retired = yield* c.publish(ep1).pipe(Effect.flip);
       expect(retired).toMatchObject({ _tag: "RetiredContentViolation", targetId: host });
-      yield* c.edit(
-        episode({ episodeId: ep1, clipOnlyMode: true, hostIds: [], expectedRevision: 1 }),
-      );
+      yield* c.edit(ep1, { hostIds: [] });
       // (7) clipOnlyMode is checked at publish: an internal show refuses it
-      yield* c.edit(episode({ episodeId: id("ep-clip"), clipOnlyMode: true, hostIds: [] }));
+      yield* c.edit(id("ep-clip"), content({ clipOnlyMode: true, hostIds: [] }));
       yield* c.schedule(id("ep-clip"), [internal], "ep-clip", "2026-12-01");
       const clip = yield* c.publish(id("ep-clip")).pipe(Effect.flip);
       expect(clip).toMatchObject({
@@ -167,6 +200,53 @@ describe("Topology F: the content domain", () => {
       });
       // ...and a partner show with one valid highlight publishes
       yield* c.publish(ep1);
+    }).pipe(Effect.provide(World)),
+  );
+
+  it.effect("keeps every revision of an episode and restores any of them (requirement 9)", () =>
+    Effect.gen(function* () {
+      const c = yield* setUp;
+      // ep1 is at revision 1 after setUp; each autosave below is one revision.
+      let last = yield* c.edit(ep1, { title: "Take 2" });
+      for (let r = 3; r <= 6; r++) last = yield* c.edit(ep1, { title: `Take ${r}` }, "alice");
+      expect(last.reply.revision).toBe(6);
+      yield* EpisodeHistory.caughtUp(last);
+      const page = yield* c.history(ep1, { take: 3 });
+      expect(page.entries.map((e) => e.event.revision)).toEqual([6, 5, 4]);
+      expect(page.entries[0]?.event).toMatchObject({
+        editor: "alice",
+        changes: { title: "Take 6" },
+      });
+      expect(page.cursor).not.toBeNull();
+      const older = yield* c.history(ep1, { take: 10, after: page.cursor! });
+      expect(older.entries.map((e) => e.event.revision)).toEqual([3, 2, 1]);
+      expect(older.cursor).toBeNull();
+
+      // Any revision's content reads back exactly as it was.
+      const third = Option.getOrThrow(yield* c.contentAt(ep1, 3));
+      expect(third).toMatchObject({ title: "Take 3", audioMasterId: master, hostIds: [host] });
+      expect(Option.isNone(yield* c.contentAt(ep1, 99))).toBe(true);
+
+      // Restoring revision 3 saves back only what differs, as a new revision.
+      const restored = Option.getOrThrow(yield* c.restore(ep1, 3, "bob"));
+      expect(restored.reply.revision).toBe(7);
+      expect((yield* c.episodes.get(ep1))?.title).toBe("Take 3");
+      yield* EpisodeHistory.caughtUp(restored);
+      const [latest] = (yield* c.history(ep1, { take: 1 })).entries;
+      expect(latest?.event).toMatchObject({
+        revision: 7,
+        editor: "bob",
+        changes: { title: "Take 3" },
+      });
+
+      // What went live stays live while the draft moves on.
+      yield* c.publish(ep1);
+      yield* c.edit(ep1, { title: "WIP" });
+      expect(yield* c.episodes.get(ep1)).toMatchObject({
+        title: "WIP",
+        publishedRevision: 7,
+        published: { title: "Take 3" },
+      });
     }).pipe(Effect.provide(World)),
   );
 });

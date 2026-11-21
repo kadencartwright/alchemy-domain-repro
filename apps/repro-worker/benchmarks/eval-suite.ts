@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { ContentDocument, SplitDocumentCms } from "@repro/cms-domain/Document/Document.aggregate";
 import { SaveDocumentDraft } from "@repro/cms-domain/Document/Document.commands";
@@ -21,10 +25,12 @@ import {
   LibraryItem,
   LibraryItemImported,
   Show,
+  SaveEpisodeFields,
   ShowImported,
 } from "@repro/cms-domain/Content/Content.aggregates";
 import { contentSeedOf } from "@repro/cms-domain/Content/Content.client";
-import { ContentDomain } from "@repro/cms-domain/Content/Content.model";
+import { EpisodeHistory } from "@repro/cms-domain/Content/Content.history";
+import { ContentDomain, ContentDomainHandlers } from "@repro/cms-domain/Content/Content.model";
 import { DocumentId, WorkspaceId } from "@repro/cms-domain/Ids";
 import { MemoryCatalogStore } from "@repro/cms-domain/Workspace/CatalogStore";
 import { Workspace } from "@repro/cms-domain/Workspace/Workspace.aggregate";
@@ -111,6 +117,13 @@ const percentile = (sorted: ReadonlyArray<number>, p: number): number => {
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const realpathOrSelf = (p: string) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+};
 
 const postJson = async <T = any>(
   path: string,
@@ -1717,7 +1730,7 @@ const measureContentStorage25k = (full25kTape: CmsTape) =>
       const segment = plan.items.find((i) => i.item.kind === "segment")!;
 
       const host = createInstrumentedDoPlatform();
-      const layer = ContentDomain.layer(Layer.empty, { legacyData: false }).pipe(
+      const layer = ContentDomain.layer(ContentDomainHandlers, { legacyData: false }).pipe(
         Layer.provide(host.layer),
       );
       yield* Effect.gen(function* () {
@@ -1758,12 +1771,92 @@ const measureContentStorage25k = (full25kTape: CmsTape) =>
     }),
   );
 
+/**
+ * Requirement 9 (full revision history) on the instrumented SQLite DO platform:
+ * what one autosave stores once the history has caught up, by object class.
+ * The episode records the edit as an event; the `EpisodeHistory` projection
+ * keeps its own input log; the `EpisodeRevisions` stream keeps the revision.
+ */
+const HISTORY_STORAGE_EDITS = 200;
+const LONG_HISTORY_REVISIONS = 1_000;
+const measureContentHistoryStorage = (full25kTape: CmsTape) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const docs = full25kTape.seedDocs.map(toDocumentMeta);
+      const plan = contentSeedOf(docs);
+      const edit = plan.episodes.find((e) => e.id === full25kTape.fixtures.editEpisodeId)!;
+      const host = createInstrumentedDoPlatform();
+      const layer = ContentDomain.layer(ContentDomainHandlers, { legacyData: false }).pipe(
+        Layer.provide(host.layer),
+      );
+      const byClass = () => {
+        const out: Record<string, { keys: number; bytes: number; puts: number; putBytes: number }> =
+          {};
+        for (const m of host.inspectAll()) {
+          if (m.instanceName !== edit.id) continue;
+          const c = (out[m.className] ??= { keys: 0, bytes: 0, puts: 0, putBytes: 0 });
+          c.keys += m.totalStoredKeys;
+          c.bytes += m.totalStoredBytes;
+          c.puts += m.puts;
+          c.putBytes += m.totalPutBytes;
+        }
+        return out;
+      };
+      let before: ReturnType<typeof byClass> = {};
+      yield* Effect.gen(function* () {
+        const episodes = yield* Episode;
+        const seeded = yield* episodes.import(
+          edit.id,
+          [new EpisodeImported({ episode: edit.episode })],
+          { commandId: "seed-ep" },
+        );
+        yield* EpisodeHistory.caughtUp(seeded);
+        yield* host.drainBackground;
+        before = byClass();
+        host.resetCounters();
+        let seen = edit.episode.fieldRevisions;
+        let last: { readonly stream: string; readonly version: number } = seeded;
+        for (let e = 0; e < HISTORY_STORAGE_EDITS; e++) {
+          // A debounced autosave of the fields an editor typed into: title and body.
+          const receipt = yield* episodes.send(
+            new SaveEpisodeFields({
+              episodeId: edit.id,
+              editor: "editor",
+              changes: {
+                title: `${edit.episode.title} (autosave ${e + 1})`,
+                bodyHash: `sha256:edit${String(e).padStart(59, "0")}`,
+              },
+              basedOn: seen,
+            }),
+          );
+          seen = receipt.reply.fieldRevisions;
+          last = receipt;
+        }
+        yield* EpisodeHistory.caughtUp(last, { timeout: "60 seconds" });
+        yield* host.drainBackground;
+      }).pipe(Effect.provide(layer));
+      const after = byClass();
+      const perEdit: Record<string, { bytes: number; keys: number; puts: number }> = {};
+      for (const [cls, a] of Object.entries(after)) {
+        const b = before[cls] ?? { keys: 0, bytes: 0, puts: 0, putBytes: 0 };
+        perEdit[cls] = {
+          bytes: (a.bytes - b.bytes) / HISTORY_STORAGE_EDITS,
+          keys: (a.keys - b.keys) / HISTORY_STORAGE_EDITS,
+          puts: a.puts / HISTORY_STORAGE_EDITS,
+        };
+      }
+      yield* host.close;
+      return { edits: HISTORY_STORAGE_EDITS, perEdit };
+    }),
+  );
+
 const runContentDomainOnWorkerd = async (
   runId: string,
   full25kTape: CmsTape,
   slice500Tape: CmsTape,
 ) => {
   const storage = await measureContentStorage25k(full25kTape);
+  const historyStorage = await measureContentHistoryStorage(full25kTape);
   const p = `f-${runId}-`;
   const f = slice500Tape.fixtures;
   const n = (id: string) => `${p}${id}`;
@@ -1783,16 +1876,39 @@ const runContentDomainOnWorkerd = async (
     managedLinkIds: editMeta.managedLinkIds,
     mediaAssetIds: editMeta.mediaAssetIds,
   };
+  type Saved = {
+    stream: string;
+    version: number;
+    reply: { revision: number; fieldRevisions: Record<string, number>; skipped: Array<string> };
+  };
+  type SaveRes = { ok: boolean; receipt?: Saved; error?: { _tag: string } };
+  /** An autosave of only `changes`, from an editor who last saw the fields at `basedOn`. */
+  const autosave = (
+    episodeId: string,
+    changes: Record<string, unknown>,
+    basedOn?: Record<string, number>,
+    commandId?: string,
+  ) =>
+    postJson<SaveRes>("/cms/content/edit", {
+      episodeId,
+      changes,
+      ...(basedOn === undefined ? {} : { basedOn }),
+      ...(commandId === undefined ? {} : { commandId }),
+    });
   const newEpisode = (episodeId: string, extra: Record<string, unknown> = {}) =>
-    postJson("/cms/content/edit", { ...content, episodeId, expectedRevision: null, ...extra });
+    autosave(episodeId, { ...content, ...extra }, {});
   type R = { ok: boolean; error?: { _tag: string } };
+  const getEpisode = (episodeId: string) =>
+    postJson<{
+      episode: { revision: number; fieldRevisions: Record<string, number>; title: string };
+    }>("/cms/content/get-episode", { episodeId });
 
-  // (1) stale revision on an autosave
-  const f1 = await postJson("/cms/content/edit", {
-    ...content,
-    episodeId: editMeta.id,
-    expectedRevision: 999,
-  });
+  // (1, revised) two editors who opened the episode at the same moment: saves to
+  // different fields merge; a save whose only field the other changed is refused.
+  const opened = (await getEpisode(editMeta.id)).data.episode.fieldRevisions;
+  const f1a = await autosave(editMeta.id, { title: `${editMeta.title} (alice)` }, opened);
+  const f1b = await autosave(editMeta.id, { bodyHash: "sha256:bob" }, opened);
+  const f1 = await autosave(editMeta.id, { title: `${editMeta.title} (bob)` }, opened);
   // (2) show slug per ownership type
   const f2 = await postJson("/cms/content/save-show", {
     showId: n("show-dup-slug"),
@@ -1838,9 +1954,18 @@ const runContentDomainOnWorkerd = async (
     releaseDate: "2029-12-26",
   });
   const f7b = await postJson<R>("/cms/content/publish", { episodeId: n("ep-clip-no-hl") });
-  // (8) publish an episode with its audio master in one step
+  // (8) publish the reviewed revision of an episode with its audio master in one
+  // step; if a co-editor saved after the review, publishing it is refused.
+  const reviewed = (await getEpisode(n("ep-unpub-master"))).data.episode.revision;
+  await autosave(n("ep-unpub-master"), { title: "A co-editor's half-finished title" });
+  const f8stale = await postJson<R>("/cms/content/publish", {
+    episodeId: n("ep-unpub-master"),
+    reviewed,
+    publishAudioMaster: true,
+  });
   const f8 = await postJson("/cms/content/publish", {
     episodeId: n("ep-unpub-master"),
+    reviewed: reviewed + 1,
     publishAudioMaster: true,
   });
   // (5, restated) retiring is always allowed; publishing against retired content is refused
@@ -1849,7 +1974,11 @@ const runContentDomainOnWorkerd = async (
   const f5 = await postJson("/cms/content/publish", { episodeId: n("ep-uses-retired") });
 
   const checks = [
-    f1.status === 409,
+    f1a.status === 200 &&
+      f1b.status === 200 &&
+      f1b.data.receipt?.reply.skipped.length === 0 &&
+      f1.status === 409 &&
+      f1.data.error?._tag === "FieldConflict",
     f2.status === 409,
     f3.status === 409,
     f4edit.status === 200 && f4.status === 409,
@@ -1857,7 +1986,7 @@ const runContentDomainOnWorkerd = async (
     f6.status === 409,
     f7a.data.error?._tag === "ClipOnlyRuleViolation" &&
       f7b.data.error?._tag === "ClipOnlyRuleViolation",
-    f8.status === 200,
+    f8stale.status === 409 && f8stale.data.error?._tag === "DraftMovedOn" && f8.status === 200,
   ];
   const invariants: CmsInvariantResults = {
     staleRevisionRejected: checks[0]!,
@@ -1873,33 +2002,144 @@ const runContentDomainOnWorkerd = async (
   if (invariants.passedCount < 8) {
     console.log(
       "Topology F probe statuses:",
-      [f1, f2, f3, f4edit, f4, f5retire, f5, f6, f7a, f7b, f8].map((r) => r.status),
+      [f1a, f1b, f1, f2, f3, f4edit, f4, f5retire, f5, f6, f7a, f7b, f8stale, f8].map(
+        (r) => r.status,
+      ),
     );
   }
 
-  // Autosaves: content edits are plain commands on the episode.
-  const current = await postJson<{ episode: { revision: number } }>("/cms/content/get-episode", {
-    episodeId: editMeta.id,
-  });
-  let revision = current.data.episode.revision;
+  // Autosaves: an editor's debounced save of the fields that changed, a plain
+  // command on the episode. The editor tracks each field's revision from replies.
+  let seen = (await getEpisode(editMeta.id)).data.episode.fieldRevisions;
+  const save = async (changes: Record<string, unknown>, commandId: string) => {
+    const res = await autosave(editMeta.id, changes, seen, commandId);
+    if (res.data.ok && res.data.receipt) seen = res.data.receipt.reply.fieldRevisions;
+    return res;
+  };
   const lats: Array<number> = [];
   for (let e = 0; e < slice500Tape.editCount; e++) {
-    const res = await postJson<{ ok: boolean; receipt?: { reply: { revision: number } } }>(
-      "/cms/content/edit",
+    const res = await save(
       {
-        ...content,
-        clipOnlyMode: editMeta.clipOnlyMode,
-        episodeId: editMeta.id,
-        expectedRevision: revision,
         title: `${editMeta.title} (autosave ${e + 1})`,
         bodyHash: `sha256:edit${String(e).padStart(59, "0")}`,
-        commandId: `edit-content-${runId}-${e}`,
       },
+      `edit-content-${runId}-${e}`,
     );
     lats.push(res.ms);
-    if (res.data.ok && res.data.receipt) revision = res.data.receipt.reply.revision;
   }
   lats.sort((a, b) => a - b);
+
+  // The same autosaves an editor sends, one second apart: the history's
+  // delivery from the previous autosave has finished before the next arrives.
+  const pacedLats: Array<number> = [];
+  for (let e = 0; e < slice500Tape.editCount; e++) {
+    await sleep(1_000);
+    const res = await save(
+      { title: `${editMeta.title} (paced ${e + 1})` },
+      `edit-paced-${runId}-${e}`,
+    );
+    pacedLats.push(res.ms);
+  }
+  pacedLats.sort((a, b) => a - b);
+
+  // Requirement 9: revision history on workerd.
+  // (1) How long after an autosave its revision is readable (the projection's lag).
+  const historyLag: Array<number> = [];
+  for (let e = 0; e < slice500Tape.editCount; e++) {
+    const res = await save(
+      { title: `${editMeta.title} (history ${e + 1})` },
+      `edit-history-${runId}-${e}`,
+    );
+    if (!res.data.ok || !res.data.receipt) continue;
+    const t0 = performance.now();
+    await postJson("/cms/content/history-caught-up", {
+      stream: res.data.receipt.stream,
+      version: res.data.receipt.version,
+    });
+    historyLag.push(res.ms + (performance.now() - t0));
+  }
+  historyLag.sort((a, b) => a - b);
+  // (2) An episode with a long history: reading pages and old revisions, and restoring one.
+  const longId = n("ep-long-history");
+  const created = await newEpisode(longId);
+  let longSeen = created.data.receipt?.reply.fieldRevisions ?? {};
+  let longRevision = created.data.receipt?.reply.revision ?? 1;
+  let longReceipt: Saved | undefined;
+  for (let e = 0; e < LONG_HISTORY_REVISIONS - 1; e++) {
+    const res = await autosave(
+      longId,
+      { title: `Long history revision ${longRevision + 1}` },
+      longSeen,
+    );
+    if (res.data.ok && res.data.receipt) {
+      longRevision = res.data.receipt.reply.revision;
+      longSeen = res.data.receipt.reply.fieldRevisions;
+      longReceipt = res.data.receipt;
+    }
+  }
+  if (longReceipt) {
+    await postJson("/cms/content/history-caught-up", {
+      stream: longReceipt.stream,
+      version: longReceipt.version,
+    });
+  }
+  const timeIt = async (call: () => Promise<{ ms: number; status: number }>, times = 5) => {
+    const ms: Array<number> = [];
+    let ok = true;
+    for (let i = 0; i < times; i++) {
+      const r = await call();
+      ms.push(r.ms);
+      ok &&= r.status === 200;
+    }
+    ms.sort((a, b) => a - b);
+    return { p50Ms: percentile(ms, 50), ok };
+  };
+  const newestPage = await timeIt(() =>
+    postJson("/cms/content/history", { episodeId: longId, take: 50 }),
+  );
+  const oldest = await postJson<{ content: { title: string } | null }>("/cms/content/revision", {
+    episodeId: longId,
+    revision: 1,
+  });
+  const readOldest = await timeIt(() =>
+    postJson("/cms/content/revision", { episodeId: longId, revision: 1 }),
+  );
+  const readMiddle = await timeIt(() =>
+    postJson("/cms/content/revision", {
+      episodeId: longId,
+      revision: Math.floor(LONG_HISTORY_REVISIONS / 2),
+    }),
+  );
+  const readNewest = await timeIt(() =>
+    postJson("/cms/content/revision", { episodeId: longId, revision: longRevision }),
+  );
+  const restoreRes = await postJson<SaveRes>("/cms/content/restore", {
+    episodeId: longId,
+    revision: 2,
+    editor: "restorer",
+  });
+  const afterRestore = await getEpisode(longId);
+  const history = {
+    pacedP50Ms: percentile(pacedLats, 50),
+    pacedP95Ms: percentile(pacedLats, 95),
+    lagP50Ms: percentile(historyLag, 50),
+    lagP95Ms: percentile(historyLag, 95),
+    revisions: longRevision,
+    newestPageP50Ms: newestPage.p50Ms,
+    readOldestP50Ms: readOldest.p50Ms,
+    readMiddleP50Ms: readMiddle.p50Ms,
+    readNewestP50Ms: readNewest.p50Ms,
+    restoreMs: restoreRes.ms,
+    correct:
+      newestPage.ok &&
+      readOldest.ok &&
+      readMiddle.ok &&
+      readNewest.ok &&
+      oldest.data.content !== null &&
+      restoreRes.data.ok &&
+      afterRestore.data.episode.revision === longRevision + 1 &&
+      afterRestore.data.episode.title === "Long history revision 2",
+  };
 
   // Contention around one hot show.
   // (a) K episodes autosaved at once: separate aggregates, nothing shared.
@@ -1907,11 +2147,11 @@ const runContentDomainOnWorkerd = async (
   //     records on that show, so all K prepare and hold it.
   const hotShow = n(f.internalShowId);
   const maxK = 32;
-  const contenders: Array<{ id: string; revision: number }> = [];
+  const contenders: Array<{ id: string; seen: Record<string, number> }> = [];
   for (let k = 0; k < maxK; k++) {
     const id = n(`contender-${k}`);
-    await newEpisode(id);
-    contenders.push({ id, revision: 1 });
+    const res = await newEpisode(id);
+    contenders.push({ id, seen: res.data.receipt?.reply.fieldRevisions ?? {} });
   }
   const level = (
     concurrency: number,
@@ -1938,16 +2178,8 @@ const runContentDomainOnWorkerd = async (
     for (let round = 0; round < 3; round++) {
       const a = await Promise.all(
         contenders.slice(0, k).map(async (c) => {
-          const res = await postJson<{ ok: boolean; receipt?: { reply: { revision: number } } }>(
-            "/cms/content/edit",
-            {
-              ...content,
-              episodeId: c.id,
-              expectedRevision: c.revision,
-              title: `Contender edit ${round}`,
-            },
-          );
-          if (res.data.ok && res.data.receipt) c.revision = res.data.receipt.reply.revision;
+          const res = await autosave(c.id, { title: `Contender edit ${round}` }, c.seen);
+          if (res.data.ok && res.data.receipt) c.seen = res.data.receipt.reply.fieldRevisions;
           return { ms: res.ms, ok: res.status === 200 && res.data.ok };
         }),
       );
@@ -1989,9 +2221,10 @@ const runContentDomainOnWorkerd = async (
       editP95Ms: percentile(lats, 95),
       editMetaBytes: storage.episodeMetaBytes,
       maxSingleDoMetaAt25kBytes,
+      editP95MaxMs: CMS_GATES.domainAutosaveP95MaxMs,
     }),
   };
-  return { result, storage, contention };
+  return { result, storage, contention, history: { ...history, storage: historyStorage } };
 };
 
 // ---------------------------------------------------------------------------
@@ -2022,7 +2255,7 @@ const main = async () => {
     `Synthetic tapes (seed=20261120): ${burstTape.name} (${burstTape.opportunities.length} opps), ${exhaustionTape.name}, ${skewedTape.name}`,
   );
   console.log(
-    `Podcast Network CMS corpus: ${cmsFull25kTape.counts.totalDocs.toLocaleString()} docs across 9 types (${cmsFull25kTape.counts.shows} shows, ${cmsFull25kTape.counts.episodes.toLocaleString()} episodes, ${cmsFull25kTape.counts.audioMasters.toLocaleString()} audioMasters, ${cmsFull25kTape.counts.segments.toLocaleString()} segments, ${cmsFull25kTape.counts.totalRefEdges.toLocaleString()} directed ref edges)`,
+    `Podcast Network CMS corpus: ${cmsFull25kTape.counts.totalDocs.toLocaleString()} docs across 8 types (${cmsFull25kTape.counts.shows} shows, ${cmsFull25kTape.counts.episodes.toLocaleString()} episodes, ${cmsFull25kTape.counts.audioMasters.toLocaleString()} audioMasters, ${cmsFull25kTape.counts.segments.toLocaleString()} segments, ${cmsFull25kTape.counts.totalRefEdges.toLocaleString()} directed ref edges)`,
   );
 
   // 1) Mocked in-memory reference baselines (falsifiable starting point)
@@ -2047,6 +2280,25 @@ const main = async () => {
     .catch(() => false);
 
   if (!alreadyRunning) {
+    // Where local DO storage lives. Local DOs are SQLite files that sync on
+    // every commit, so on disk the numbers mostly measure the disk (~6 ms per
+    // sync on the machine these were taken on). BENCH_STORAGE=memory (the
+    // default) puts `.alchemy` on tmpfs; BENCH_STORAGE=disk keeps it on disk.
+    // Neither matches Cloudflare, whose commits wait for replication.
+    const alchemyDir = fileURLToPath(new URL("../.alchemy", import.meta.url));
+    const storageMode = process.env.BENCH_STORAGE === "disk" ? "disk" : "memory";
+    if (process.env.BENCH_KEEP_STATE !== "1") {
+      // Start from empty storage: state left by earlier runs accumulates, and a
+      // newly added projection backfills over all of it at startup.
+      rmSync(alchemyDir, { recursive: true, force: true });
+      if (storageMode === "memory") {
+        const base = existsSync("/dev/shm") ? "/dev/shm" : tmpdir();
+        symlinkSync(mkdtempSync(join(base, "repro-alchemy-")), alchemyDir);
+      }
+    }
+    console.log(
+      `Local DO storage: ${storageMode} (${realpathOrSelf(alchemyDir)})${process.env.BENCH_KEEP_STATE === "1" ? ", kept from earlier runs" : ", empty"}`,
+    );
     console.log("Starting local `alchemy dev --stage local` (real local workerd DOs)...");
     child = spawn("pnpm", ["exec", "alchemy", "dev", "--stage", "local"], {
       stdio: ["ignore", "ignore", "ignore"],
@@ -2122,6 +2374,31 @@ const main = async () => {
     console.log(
       "\nRunning 25,000-doc Podcast Network CMS candidates against real local workerd DOs + SQLite DOs...",
     );
+    // BENCH_CMS=E (or F, or "E,F") runs only those models, to isolate one from another.
+    const only = process.env.BENCH_CMS?.split(",");
+    if (only !== undefined) {
+      if (only.includes("E")) {
+        const d = await runDecisionCmsOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
+        console.log(
+          "Topology E alone:",
+          d.result.editP50Ms.toFixed(1),
+          "/",
+          d.result.editP95Ms.toFixed(1),
+          "ms",
+        );
+      }
+      if (only.includes("F")) {
+        const c = await runContentDomainOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
+        console.log(
+          "Topology F alone:",
+          c.result.editP50Ms.toFixed(1),
+          "/",
+          c.result.editP95Ms.toFixed(1),
+          "ms",
+        );
+      }
+      return;
+    }
     const cms = await runCmsCandidatesOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
     const dec = await runDecisionCmsOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
     const con = await runContentDomainOnWorkerd(runId, cmsFull25kTape, cmsSlice500Tape);
@@ -2130,7 +2407,7 @@ const main = async () => {
       { name: "Monolith Workspace DO", res: cms.monolithResult },
       { name: "Naive Split ContentDocument DO", res: cms.splitResult },
       { name: "Topology E: Per-Doc Aggregates + Decision", res: dec.result },
-      { name: "Topology F: Content Domain (3 of 8 restated)", res: con.result },
+      { name: "Topology F: Content Domain (3 of 8 restated; autosave gate 2 s)", res: con.result },
     ];
 
     console.log("\n### 2. Podcast Network CMS (25,000 Docs) — Falsifiable Scorecard");
@@ -2193,6 +2470,28 @@ const main = async () => {
       const b = con.contention.schedule[i]!;
       console.log(
         `| ${a.concurrency} | ${a.p50Ms.toFixed(0)} / ${a.p95Ms.toFixed(0)} / ${a.maxMs.toFixed(0)} ms | ${a.failed}/${a.total} | ${b.p50Ms.toFixed(0)} / ${b.p95Ms.toFixed(0)} / ${b.maxMs.toFixed(0)} ms | ${b.failed}/${b.total} |`,
+      );
+    }
+    const h = con.history;
+    console.log("\nTopology F revision history (requirement 9):");
+    console.log(
+      `  - Correct (pages, oldest and middle revisions, restore): ${h.correct ? "yes" : "NO"}`,
+    );
+    console.log(
+      `  - Autosaves one second apart (an editor's cadence): p50 ${h.pacedP50Ms.toFixed(1)} ms / p95 ${h.pacedP95Ms.toFixed(1)} ms`,
+    );
+    console.log(
+      `  - Autosave until its revision is readable: p50 ${h.lagP50Ms.toFixed(1)} ms / p95 ${h.lagP95Ms.toFixed(1)} ms`,
+    );
+    console.log(
+      `  - Episode with ${h.revisions.toLocaleString()} revisions: newest 50 ${h.newestPageP50Ms.toFixed(1)} ms; content at revision 1 ${h.readOldestP50Ms.toFixed(1)} ms, middle ${h.readMiddleP50Ms.toFixed(1)} ms, newest ${h.readNewestP50Ms.toFixed(1)} ms; restore ${h.restoreMs.toFixed(1)} ms`,
+    );
+    console.log(
+      `  - Stored per autosave (${h.storage.edits} autosaves, instrumented SQLite DOs), by object class:`,
+    );
+    for (const [cls, v] of Object.entries(h.storage.perEdit)) {
+      console.log(
+        `    - ${cls}: +${v.bytes.toFixed(0)} B, +${v.keys.toFixed(2)} keys, ${v.puts.toFixed(2)} puts`,
       );
     }
   } finally {

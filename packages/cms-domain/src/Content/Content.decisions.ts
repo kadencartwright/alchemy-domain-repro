@@ -14,6 +14,7 @@ import {
 import {
   AudioMaster,
   AudioMasterPublished,
+  contentOf,
   Episode,
   EpisodePublished,
   EpisodeScheduled,
@@ -40,6 +41,13 @@ const uniq = <A extends string>(xs: ReadonlyArray<A>): Array<A> => [...new Set(x
 export class StaleContentRead extends Domain.Rejection(
   "StaleContentRead",
   { id: Schema.String },
+  { httpApiStatus: 409 },
+) {}
+
+/** The draft has been saved since the publisher reviewed it: re-review, then publish. */
+export class DraftMovedOn extends Domain.Rejection(
+  "DraftMovedOn",
+  { episodeId: DocumentId, reviewed: Revision, current: Revision },
   { httpApiStatus: 409 },
 ) {}
 
@@ -184,29 +192,25 @@ export class Scheduling extends Domain.Decision(ScheduleEpisode, {
     for (const id of ep.showIds) {
       if (unchanged && cmd.showIds.includes(id)) continue;
       out.push(
-        byId
-          .get(id)!
-          .record(
-            new EpisodeSlotsReleased({
-              episodeId: cmd.episodeId,
-              slug: ep.slug,
-              releaseDate: ep.releaseDate,
-            }),
-          ),
+        byId.get(id)!.record(
+          new EpisodeSlotsReleased({
+            episodeId: cmd.episodeId,
+            slug: ep.slug,
+            releaseDate: ep.releaseDate,
+          }),
+        ),
       );
     }
     for (const id of cmd.showIds) {
       if (unchanged && ep.showIds.includes(id)) continue;
       out.push(
-        byId
-          .get(id)!
-          .record(
-            new EpisodeSlotsTaken({
-              episodeId: cmd.episodeId,
-              slug: cmd.slug,
-              releaseDate: cmd.releaseDate,
-            }),
-          ),
+        byId.get(id)!.record(
+          new EpisodeSlotsTaken({
+            episodeId: cmd.episodeId,
+            slug: cmd.slug,
+            releaseDate: cmd.releaseDate,
+          }),
+        ),
       );
     }
     return out;
@@ -218,6 +222,8 @@ export class Scheduling extends Domain.Decision(ScheduleEpisode, {
 export class PublishEpisode extends Domain.Command("PublishEpisode", {
   input: {
     episodeId: DocumentId,
+    /** The draft revision the publisher reviewed: exactly that goes live, or nothing. */
+    revision: Revision,
     /** What the episode depends on, as the caller last read it; the decision checks it. */
     audioMasterId: Schema.NullOr(DocumentId),
     showIds: Schema.Array(DocumentId),
@@ -233,6 +239,7 @@ export class PublishEpisode extends Domain.Command("PublishEpisode", {
     PublishReadinessViolation,
     ClipOnlyRuleViolation,
     StaleContentRead,
+    DraftMovedOn,
   ],
 }) {}
 
@@ -248,6 +255,9 @@ export class EpisodePublication extends Domain.Decision(PublishEpisode, {
     const ep = episode.state;
     if (ep === null) return new DocumentNotFound({ documentId: cmd.episodeId });
     const id = cmd.episodeId;
+    if (ep.revision !== cmd.revision) {
+      return new DraftMovedOn({ episodeId: id, reviewed: cmd.revision, current: ep.revision });
+    }
     // The caller must have named exactly what the episode depends on now.
     if (ep.audioMasterId !== cmd.audioMasterId)
       return new StaleContentRead({ id: ep.audioMasterId ?? "no audio master" });
@@ -324,7 +334,13 @@ export class EpisodePublication extends Domain.Decision(PublishEpisode, {
     }
     const now = DateTime.toEpochMillis(ctx.now);
     const out: Array<Recorded> = [
-      episode.record(new EpisodePublished({ publishedRevision: ep.revision, publishedAt: now })),
+      episode.record(
+        new EpisodePublished({
+          publishedRevision: ep.revision,
+          content: contentOf(ep),
+          publishedAt: now,
+        }),
+      ),
     ];
     if (cmd.publishAudioMaster && m !== undefined && m.state !== null && !m.state.published) {
       out.push(m.record(new AudioMasterPublished({ publishedAt: now })));

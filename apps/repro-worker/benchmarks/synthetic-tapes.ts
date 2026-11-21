@@ -291,6 +291,11 @@ export const CMS_GATES = {
   requiredInvariantsPassed: 8,
   /** Single-field editorial autosave p95 on real local workerd DOs. */
   editP95MaxMs: 30,
+  /**
+   * The same, as the domain review restated it for Topology F: a debounced
+   * autosave the editor doesn't wait on only has to be durable within seconds.
+   */
+  domainAutosaveP95MaxMs: 2_000,
   /** Meta state bytes rewritten per single-field autosave (O(1)). */
   maxEditMetaBytes: 4_096,
   /**

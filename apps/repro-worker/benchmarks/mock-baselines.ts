@@ -459,9 +459,11 @@ export const evaluateCmsGates = (args: {
   readonly editP95Ms: number;
   readonly editMetaBytes: number;
   readonly maxSingleDoMetaAt25kBytes: number;
+  /** Overrides the autosave gate (Topology F uses the domain review's). */
+  readonly editP95MaxMs?: number;
 }) => {
   const invariantsPass = args.invariants.passedCount === CMS_GATES.requiredInvariantsPassed;
-  const editLatencyPass = args.editP95Ms <= CMS_GATES.editP95MaxMs;
+  const editLatencyPass = args.editP95Ms <= (args.editP95MaxMs ?? CMS_GATES.editP95MaxMs);
   const editMetaPass = args.editMetaBytes <= CMS_GATES.maxEditMetaBytes;
   const scale25kCapPass = args.maxSingleDoMetaAt25kBytes <= CMS_GATES.maxSingleDoMetaAt25kBytes;
   return {

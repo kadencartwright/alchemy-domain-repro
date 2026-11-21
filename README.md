@@ -26,6 +26,7 @@ pnpm typecheck
 pnpm test            # Story tests + Decision model tests + 25k-doc oracle tests + local DO tests
 pnpm bench:eval      # Falsifiable scorecard (oracle vs. each modeling attempt) on local workerd
 BENCH_ONLY=cms pnpm bench:eval   # CMS models only (skips the slow ad network runs)
+BENCH_ONLY=cms BENCH_STORAGE=disk pnpm bench:eval   # same, with local DO storage on disk
 pnpm bench:workerd   # Focused real local workerd DO load probe
 pnpm bench:quota     # DO key-prefix & storage breakdown (Ads)
 pnpm bench:cms       # DO "meta" size scaling from 100 -> 25,000 CMS docs
@@ -46,7 +47,12 @@ pnpm bench:cms       # DO "meta" size scaling from 100 -> 25,000 CMS docs
 2. **In-memory reference oracles** ([mock-baselines.ts](apps/repro-worker/benchmarks/mock-baselines.ts), verified in [benchmarks.test.ts](apps/repro-worker/test/benchmarks.test.ts)):
    - `MockQuotaReference` and `MockCmsReference` (running the full 25,000-doc corpus in memory) execute the same tapes and **pass 100% of acceptance gates**. They define the target behavior; they are not a deployable design.
 
-**About the latency numbers:** local `alchemy dev` runs every Durable Object in one `workerd` process on one machine, so absolute latencies, and especially latencies under concurrency, are higher and noisier than on Cloudflare. Compare models within one run. Storage, fill, accuracy and invariant results are exact and repeat run to run.
+**About the latency numbers:** local `alchemy dev` runs every Durable Object in one `workerd` process on one machine, and stores each one as a SQLite file that syncs on every commit. Where those files live dominates the latencies, so the benchmark runs with an empty `.alchemy` each time and reports the CMS latencies two ways:
+
+- **Memory** (`BENCH_STORAGE=memory`, the default): `.alchemy` on tmpfs, so a sync costs microseconds. This measures the models and the framework.
+- **Disk** (`BENCH_STORAGE=disk`): `.alchemy` on the machine's disk, where a synchronous write took ~6 ms. Each commit pays it, so models that commit more often pay more.
+
+Neither matches Cloudflare, where a commit waits for replication. Compare models within one storage mode. Storage, fill, accuracy and invariant results are exact and the same in both. *(Earlier versions of this README reported disk-backed numbers only, with storage left over from previous runs; the ad network numbers below are still from those runs.)*
 
 ---
 
@@ -82,6 +88,8 @@ And one property of `keyOf`: **it sees only the command.** Instances that follow
 | **Topology D** | Per-`Campaign` DOs + `CampaignSelection` decision ([CampaignSelection.decision.ts](packages/quota-domain/src/Campaign/CampaignSelection.decision.ts)) | Restores atomic weighted selection: one decision reads every candidate campaign, picks by weight among those with capacity, and records the reservation on the chosen one. |
 
 ### Scorecard (`pnpm bench:eval`, real local `workerd` DOs + SQLite storage probe)
+
+*Disk-backed numbers, from a run before the benchmark cleared or relocated local DO storage. Not rerun since: latencies are probably inflated, storage figures are exact.*
 
 **Acceptance gates:** Burst `p95 <= 100 ms` and `wall <= 4500 ms` | Skewed fill `>= 98%` | Exhaustion exactly `40/40` + `0` duplicate double-counts + finalized `$500` invoice | Storage `<= 600 B/opp` and `<= 4 putKeys/opp`
 
@@ -121,6 +129,15 @@ A toy 3-type CMS hides where things break at scale, so the corpus models a reali
   7. Multi-hop `clipOnlyMode` rule: requires `show.ownershipType === "partner"` **and** the referenced `audioMaster` having **exactly 1 valid `"highlight"` chapter** inside `durationSeconds` (`409 ClipOnlyRuleViolation`)
   8. Atomic multi-doc publish (`[audioMaster, episode]`)
 
+### Domain review: how editors actually work
+
+The requirements above came from the existing CMS, and every model up to E was built against them. Reviewing them against how editors work changed four, and Topology F is built against the revised set. The older models stay scored against the original requirements, as the database-shaped attempts.
+
+- **Autosave is debounced and live.** It fires after typing pauses, about once a second per active editor, and nobody waits on it: it only has to be durable within a few seconds. F's autosave gate is therefore **p95 ≤ 2 s**, not the 30 ms the older models are held to.
+- **Co-editors merge field by field (revises invariant 1).** Two editors changing different fields of one episode both succeed. If an editor changes a field that someone else changed after they last saw it, that field is refused and the editor is shown the other value; the rest of the save still applies. There's no merging inside one field.
+- **Publish names the revision that was reviewed (extends invariant 8).** Exactly that revision goes live, or nothing: if the draft has been saved since the review, publish is refused and the publisher re-reviews.
+- **Requirement 9, full revision history.** Every autosave is a revision. Any revision can be listed and read back, and restored as a new revision. Autosaves are constant; reading history and restoring are rare.
+
 ### Modeling Attempts
 
 | Model | Aggregate boundary | What happens at 25,000 docs |
@@ -129,7 +146,7 @@ A toy 3-type CMS hides where things break at scale, so the corpus models a reali
 | **Monolith `Workspace` DO** | 1 DO holds every `DocumentMeta` in KV `"meta"` ([Workspace.aggregate.ts](packages/cms-domain/src/Workspace/Workspace.aggregate.ts)) | Enforces 8/8 invariants atomically, but `"meta"` reaches **18.21 MiB at 25,000 docs (910% of Cloudflare's 2 MiB value cap)**. |
 | **Naive split `ContentDocument` DO** | 1 DO per document, plain commands ([Document.aggregate.ts](packages/cms-domain/src/Document/Document.aggregate.ts)) | Small `"meta"` and fast edits, but can only enforce **1/8** invariants locally. |
 | **Topology E: per-document aggregates + `Decision`** | `CmsDocument(docId)`, `UniqueClaim(value)`, `InboundRefs(docId)`, and one decision per command ([Decision/](packages/cms-domain/src/Decision/)) | **8/8 invariants** with **no instance above 0.8 KiB**, but every save is a distributed transaction. |
-| **Topology F: the content domain** | `Show`, `ShowHandle`, `Episode`, `AudioMaster`, `LibraryItem`, with decisions only for naming a show, scheduling an episode and publishing ([Content/](packages/cms-domain/src/Content/)) | **8/8**, with **3 invariants restated** as content rules; autosaves are plain single-aggregate commands; no instance above 1.6 KiB. |
+| **Topology F: the content domain** | `Show`, `ShowHandle`, `Episode`, `AudioMaster`, `LibraryItem`, with decisions only for naming a show, scheduling an episode and publishing ([Content/](packages/cms-domain/src/Content/)) | **8/8 on the revised requirements**, with **3 invariants restated** as content rules; autosaves are field patches, plain single-aggregate commands; full revision history; no instance above 1.6 KiB. |
 
 #### Topology E: the CMS's model, made atomic
 
@@ -149,66 +166,75 @@ E, like every model before it, treats the podcast network the way a CMS does: as
 
 - **`Show`** owns its schedule: the episode slugs and release dates taken within it.
 - **`ShowHandle`** is a show's public slug, unique per ownership type.
-- **`Episode`** owns its draft. An editor's autosave (`EditEpisodeDraft`) is a plain command on one aggregate.
+- **`Episode`** owns its draft, with a revision per field. An editor's autosave (`SaveEpisodeFields`) carries only the fields that changed and the revision of each that the editor last saw; it's a plain command on one aggregate. Fields a co-editor changed since are skipped and listed in the event, so the history records them too.
 - **`AudioMaster`** and **`LibraryItem`** (segments, hosts, links, media, channel welcomes) are content an episode uses.
 - **Decisions** run only where a rule genuinely spans aggregates: `ShowNaming` (a show and its handle), `Scheduling` (an episode and the shows it joins or leaves) and `EpisodePublication` (an episode, its audio master, its shows and its library content).
 
-Five of the eight invariants are kept exactly. The other three are restated as rules about content rather than about references, which is a change to the requirements, not only to the model:
+Of the eight invariants, five are kept (two of them revised by the domain review) and three are restated as rules about content rather than about references. Those restatements are a change to the requirements, not only to the model:
 
 | # | Invariant | In Topology F |
 |---|---|---|
-| 1 | Optimistic concurrency | **Kept.** `expectedRevision` on every aggregate. |
+| 1 | Optimistic concurrency | **Revised:** per field on `Episode` (co-editors merge; a stale field is refused), `expectedRevision` on the other aggregates. |
 | 2 | Show slug unique per ownership type | **Kept.** `ShowHandle`, taken and released by `ShowNaming`. |
 | 3 | Episode slug and date unique within every owning show | **Kept.** The show's own schedule, updated by `Scheduling` on every show the episode joins or leaves. |
 | 4 | No dangling strong references | **Restated:** a draft may reference anything; an episode can't *publish* against content that doesn't exist. |
 | 5 | No deleting content in use | **Restated:** content is never hard-deleted. Retiring is always allowed, and an episode can't publish against retired content. Published episodes keep what they published. |
 | 6 | Publish needs a published, playable audio master | **Kept.** Checked by `EpisodePublication`. |
 | 7 | `clipOnlyMode` needs a partner show and one valid highlight | **Restated (timing):** checked when the episode publishes, not on every edit. |
-| 8 | Atomic multi-document publish | **Kept.** An episode publishes with its audio master in one step. |
+| 8 | Atomic multi-document publish | **Kept and extended:** the reviewed revision of an episode publishes with its audio master in one step, or not at all if the draft has moved on (`DraftMovedOn`). |
 
-One consequence of the restatements: show and audio master references (a show's hosts, an audio master's segments) aren't checked by any rule, because only episodes publish here. Specified in [Content.test.ts](packages/cms-domain/test/Content.test.ts); probed on `workerd` with the same 8 checks as the other models, with the restated ones checking the restated rule (for example, invariant 5 checks that retiring succeeds and that a later publish against the retired asset is refused).
+One consequence of the restatements: show and audio master references (a show's hosts, an audio master's segments) aren't checked by any rule, because only episodes publish here. Specified in [Content.test.ts](packages/cms-domain/test/Content.test.ts); probed on `workerd` with the same 8 checks as the other models, with the restated ones checking the restated rule (for example, invariant 5 checks that retiring succeeds and that a later publish against the retired asset is refused; invariant 1 checks that two editors' saves to different fields merge and that a stale field is refused).
+
+#### Revision history (requirement 9)
+
+An aggregate's events already hold every revision, but alchemy clients can only `get` an aggregate's state. So the history is a projection, [`EpisodeHistory`](packages/cms-domain/src/Content/Content.history.ts), that appends each autosave's patch (editor, changed fields, skipped fields) to a `Domain.Stream` keyed by episode. The draft at any revision is those patches folded; restoring saves back the fields that differ, as a new revision, so a restore can be undone.
+
+| | Memory | Disk |
+|---|---:|---:|
+| Autosaves one second apart (an editor's cadence), p50 / p95 | 8.9 / 10.2 ms | 74.9 / 91.5 ms |
+| From autosave until its revision is readable, p50 / p95 | 9.5 / 10.9 ms | 78.7 / 84.9 ms |
+| Episode with 1,000 revisions: newest 50 revisions | 4.0 ms | 4.2 ms |
+| ...the content at revision 1 / 500 / 1,000 | 5.8 / 5.7 / 9.1 ms | 6.7 / 7.0 / 12.8 ms |
+| Restore an old revision | 10.2 ms | 66.5 ms |
+
+What history costs per autosave, measured on the instrumented SQLite platform over 200 autosaves: the episode stores the edit (1,111 B, 2 keys) and now makes **8 storage writes instead of 4**, because any projection on an aggregate stages a delivery and a 10-second backstop alarm with every commit; the projection keeps its own input log (766 B); the stream keeps the revision (435 B). Each revision is stored three times. In memory that costs F's autosave about 2 ms (4.0 → 6.2 ms p50); on disk, where each write syncs, it's most of the 73 ms.
+
 
 ### Scorecard (`pnpm bench:eval`, real local `workerd` DOs + 25,000-doc SQLite DO probes)
 
-**Acceptance gates:** Invariants `8/8` | Edit `p95 <= 30 ms` | Edit `"meta"` `<= 4 KiB` | Max single-DO `"meta"` @ 25,000 docs `<= 1.50 MiB` *(Cloudflare SQLite DO limit: 2.00 MiB)*
+**Acceptance gates:** Invariants `8/8` | Autosave `p95 <= 30 ms` (Topology F: `<= 2 s`, from the domain review) | Edited instance `<= 4 KiB` | Largest single instance @ 25,000 docs `<= 1.50 MiB` *(Cloudflare SQLite DO limit: 2.00 MiB)*
 
-| Model | Invariants | Edit p50 | Edit p95 | Edit `meta` | Max DO `meta` @25,000 docs | % of 2 MiB DO cap | Verdict |
+| Model | Invariants | Autosave p50 / p95, **memory** | Autosave p50 / p95, disk | Edited instance | Largest instance @25,000 docs | % of 2 MiB cap | Verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **Oracle** *(in-memory, 25k docs)* | 8/8 | 0.0 ms | 0.0 ms | 0.6 KiB | 0.6 KiB | 0.0% | **PASS** |
-| **Monolith `Workspace` DO** | 8/8 | 117.9 ms | 126.5 ms | 371.5 KiB *(500-doc slice)* | **18.21 MiB** | **910.5%** | **FAIL** |
-| **Naive split `ContentDocument` DO** | **1/8** | 11.5 ms | 13.7 ms | 0.3 KiB | 0.3 KiB | 0.0% | **FAIL** |
-| **Topology E: Per-Doc + `Decision`** | **8/8** | 135.5 ms | 138.2 ms | 0.8 KiB | **0.8 KiB** | **0.0%** | **FAIL** *(latency)* |
-| **Topology F: Content domain** | **8/8** *(3 restated)* | 11.2 ms | 12.2 ms | 0.4 KiB | **1.6 KiB** | **0.1%** | **PASS** *(on restated rules)* |
+| **Oracle** *(in-memory, 25k docs)* | 8/8 | 0.0 / 0.0 ms | — | 0.6 KiB | 0.6 KiB | 0.0% | **PASS** |
+| **Monolith `Workspace` DO** | 8/8 | 11.2 / 14.2 ms | 121.5 / 126.0 ms | 371.5 KiB *(500-doc slice)* | **18.21 MiB** | **910.5%** | **FAIL** *(size)* |
+| **Naive split `ContentDocument` DO** | **1/8** | 3.2 / 4.0 ms | 11.7 / 13.1 ms | 0.3 KiB | 0.3 KiB | 0.0% | **FAIL** *(invariants)* |
+| **Topology E: Per-Doc + `Decision`** | **8/8** | 24.8 / **59.8 ms** | 1,528.8 / 3,174.8 ms | 0.8 KiB | **0.8 KiB** | **0.0%** | **FAIL** *(latency)* |
+| **Topology F: Content domain** | **8/8** *(revised; 3 restated)* | 6.2 / 10.3 ms | 72.7 / 209.5 ms | 0.8 KiB | **1.6 KiB** | **0.1%** | **PASS** *(on the revised requirements)* |
 
-*(The CMS numbers come from one `BENCH_ONLY=cms pnpm bench:eval` run, so every CMS model shares the same machine load; the ad network numbers come from an earlier full run. The ad network code hasn't changed since.)*
+*(Each column comes from one `BENCH_ONLY=cms pnpm bench:eval` run, with empty local storage, so the models in a column share the same machine. F's autosave includes its revision history.)*
+
+On disk, E's autosave was 135 ms p50 in earlier runs and rose to ~1.5 s once F's revised model joined the same worker, even when E ran alone; with memory storage it stays at 25 ms. That points at local storage, not at E, but the mechanism isn't identified.
 
 At 25,000 documents, E has `25,000` `CmsDocument`, `19,350` `UniqueClaim` and `15,623` `InboundRefs` instances; its heaviest is the edited episode's `CmsDocument` at **0.8 KiB**, and its heaviest `InboundRefs` (a `show` with 34 referrers) is 0.6 KiB. F has `350` `Show`, `8,300` `Episode`, `5,000` `AudioMaster` and `11,350` `LibraryItem` instances, plus a `ShowHandle` per show; its heaviest is the busiest show's schedule (33 episodes) at **1.6 KiB**.
 
-**Contention, Topology E.** K documents saved at once, all involving the same `host` (3 rounds per K):
+**Contention.** K commands at once, 3 rounds per K, p95 (all 246 commands succeeded in every run). Columns (a) share no instances, so they measure local `workerd` under load; columns (b) add what holding the same instances costs: in E, a popular host's `CmsDocument` and `InboundRefs`, which every new episode referencing it records on; in F, the show that every scheduling decision records on.
 
-| K | (a) Autosave; refs unchanged, host not read: p50 / p95 / max | failed | (b) New episode adds a ref to the host: p50 / p95 / max | failed |
+| K | E (a) autosave: memory / disk | E (b) new episode references the host: memory / disk | F (a) autosave: memory / disk | F (b) schedule an episode into the show: memory / disk |
 |---:|---:|---:|---:|---:|
-| 1 | 107 / 110 / 110 ms | 0/3 | 170 / 171 / 171 ms | 0/3 |
-| 8 | 417 / 417 / 417 ms | 0/24 | 889 / 1,751 / 1,796 ms | 0/24 |
-| 32 | 1,366 / 1,487 / 1,487 ms | 0/96 | 3,979 / 7,088 / 7,504 ms | 0/96 |
-
-**Contention, Topology F.** K commands at once around the same show (3 rounds per K):
-
-| K | (a) Autosave, a plain command on each episode: p50 / p95 / max | failed | (b) Schedule a new episode into the show: p50 / p95 / max | failed |
-|---:|---:|---:|---:|---:|
-| 1 | 12 / 61 / 61 ms | 0/3 | 138 / 148 / 148 ms | 0/3 |
-| 8 | 66 / 66 / 67 ms | 0/24 | 1,447 / 8,233 / 8,456 ms | 0/24 |
-| 32 | 464 / 721 / 721 ms | 0/96 | 17,088 / 25,087 / 25,673 ms | 0/96 |
-
-Columns (a) share no instances, so they measure local `workerd` under load. Columns (b) add what holding the same instances costs: in E, the host's `CmsDocument` and `InboundRefs`; in F, the show itself, which every scheduling decision records on.
+| 1 | 7 / 105 ms | 11 / 169 ms | 16 / 302 ms | 12 / 340 ms |
+| 8 | 19 / 425 ms | 82 / 1,700 ms | 29 / 628 ms | 155 / 2,105 ms |
+| 32 | 64 / 1,404 ms | 325 / 6,891 ms | 91 / 2,750 ms | 622 / 19,390 ms |
 
 ### What This Shows
 
 1. **`Domain.Decision` removes the monolith's state-size wall.** E holds all 8 invariants with every instance under 1 KiB, versus 18.21 MiB in one `"meta"` value. Atomic publish needs no saga.
-2. **Applied to the CMS's model, every edit becomes a distributed transaction.** Even a decision that reads only its own document takes ~110 ms locally, against ~11 ms for the same edit as a plain command; E's benchmark autosave (3 instances) takes 136 ms p50 / 138 ms p95. Prepares run one after another, so latency scales with the instances read.
-3. **Modeling the content domain moves Decision to where rules really span aggregates.** In F, editing is a plain command (11.2 ms p50 / 12.2 ms p95, under the 30 ms gate), and decisions run only when a show is named, an episode is scheduled or published. F passes every gate, but on three restated invariants, which are a product decision as much as a modeling one.
-4. **Contention follows the rule's owner.** In E, popular *referenced* documents (a host or show) are contended by every save that starts or stops referencing them. In F, a show is contended only by episodes being scheduled into it at the same moment: realistic for a bulk import (25.1 s p95 at K = 32), rare for editors.
-5. **The caller has to know the aggregate's state.** Because `keyOf` sees only the command, E's renames, reference changes and deletes, and F's scheduling and publishing, read before they send and check that read is still current.
+2. **Applied to the CMS's model, every edit becomes a distributed transaction.** In memory, a decision that reads only its own document takes ~5 ms against ~3 ms as a plain command; E's benchmark autosave (3 instances) takes 25 ms p50 / 60 ms p95, over the 30 ms gate. Prepares run one after another and each is a commit, so on disk, where commits are expensive, E's autosave reaches seconds.
+3. **Modeling the content domain moves Decision to where rules really span aggregates.** In F, editing is a plain command (6.2 / 10.3 ms in memory, 73 / 210 ms on disk, with revision history), and decisions run only when a show is named or an episode is scheduled or published. F passes on three restated invariants and the domain review's revised ones, which are product decisions as much as modeling ones.
+4. **Most of the original requirements were shaped like a database.** Synchronous strong references, delete-in-use, a single document revision and a 30 ms autosave were the existing system's guarantees, not the editors'. Restated as what editors need (retire instead of delete, check at publish, merge co-editors by field, durable within seconds), the hardest costs disappear rather than getting faster.
+5. **Contention follows the rule's owner.** In E, popular *referenced* documents (a host or show) are contended by every save that starts or stops referencing them. In F, a show is contended only by episodes being scheduled into it at the same moment: realistic for a bulk import (622 ms p95 in memory, 19.4 s on disk, at K = 32), rare for editors, and better modeled as one `ImportSchedule` command on the show.
+6. **The caller has to know the aggregate's state.** Because `keyOf` sees only the command, E's renames, reference changes and deletes, and F's scheduling and publishing, read before they send and check that read is still current.
+7. **Revision history is cheap to read and costs every write.** Reads stay in single-digit milliseconds at 1,000 revisions, but the history is a projection copying events the aggregate already stores, so every autosave doubles its storage writes and each revision is stored three times (question 6).
 
 ---
 
@@ -219,4 +245,5 @@ Columns (a) share no instances, so they measure local `workerd` under load. Colu
 3. **`keyOf` from state:** is there an idiomatic way to involve instances that depend on an aggregate's current state (its claims, its outgoing references) without the caller naming them and the decision validating them (the `observed` + `StaleRead` pattern here)?
 4. **High-throughput shared quota (Ads):** when every request must atomically choose among, and decrement, a small shared set of budgets at hundreds of requests per second, neither one aggregate (A), independent aggregates (B, C), nor a decision over all of them (D) keeps up. What is the recommended boundary?
 5. **Domain model vs. CMS model:** Topology F passes by modeling shows, episodes and content directly, and by restating three CMS invariants as content rules (retire instead of delete, check references and `clipOnlyMode` at publish). Is that the shape you'd recommend for `@alchemy.run/domain`, and are those restatements the ones you'd expect a domain model to make?
-6. **Framework key retention and compaction:** even with pruned user state, `event:*`, `receipt:*`, `seen:*`, `armed:*`, `scheduled:*`, and `cb:*` keys grow monotonically (~27 puts/opp in Topology A with its policy; ~12 in Topology B without one; ~25 with a decision). Are snapshot compaction, `receipt:*` TTLs, or retention policies planned, so high-volume aggregates don't hit Cloudflare's 10 GB DO limit?
+6. **Reading an aggregate's own history:** an aggregate's event log already holds every revision, but clients can only `get` its state. Revision history therefore needs a projection that copies each edit into a `Domain.Stream`, and any reaction on an aggregate adds a cost to every commit (see [Revision history](#revision-history-requirement-9)). Could an aggregate expose `events` / `list` on its own stream, even as a slow read, for histories that are read rarely?
+7. **Framework key retention and compaction:** even with pruned user state, `event:*`, `receipt:*`, `seen:*`, `armed:*`, `scheduled:*`, and `cb:*` keys grow monotonically (~27 puts/opp in Topology A with its policy; ~12 in Topology B without one; ~25 with a decision). Are snapshot compaction, `receipt:*` TTLs, or retention policies planned, so high-volume aggregates don't hit Cloudflare's 10 GB DO limit? And how would compaction interact with full revision history, and with a projection's `version` bump, which replays the whole log?
